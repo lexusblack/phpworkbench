@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -33,6 +33,81 @@ struct LsResponse {
     entries: Vec<LsEntry>,
 }
 
+#[derive(Debug, Serialize)]
+struct DownloadResponse {
+    server: String,
+    path: String,
+    to: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteResponse {
+    server: String,
+    path: String,
+    deleted: bool,
+}
+
+#[derive(Debug, Default)]
+struct Args {
+    config_path: Option<PathBuf>,
+    server_name: Option<String>,
+    dry_run: bool,
+    interval: u64,
+    file: Option<PathBuf>,
+    command: Option<String>,
+    remote_path: Option<String>,
+    to: Option<PathBuf>,
+    allow_delete: bool,
+    recursive: bool,
+    json: bool,
+    help: bool,
+}
+
+impl Args {
+    fn parse<I>(arguments: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut parsed = Args {
+            interval: 2,
+            ..Args::default()
+        };
+        let mut args = arguments.into_iter();
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--config" => {
+                    parsed.config_path = Some(PathBuf::from(args.next().context("--config path")?))
+                }
+                "--server" => parsed.server_name = Some(args.next().context("--server name")?),
+                "--file" => parsed.file = Some(PathBuf::from(args.next().context("--file path")?)),
+                "--path" => parsed.remote_path = Some(args.next().context("--path REMOTE_PATH")?),
+                "--to" => parsed.to = Some(PathBuf::from(args.next().context("--to LOCAL_PATH")?)),
+                "--json" => parsed.json = true,
+                "--allow-delete" => parsed.allow_delete = true,
+                "--recursive" => parsed.recursive = true,
+                "--interval" => {
+                    parsed.interval = args
+                        .next()
+                        .context("--interval seconds")?
+                        .parse()
+                        .context("invalid --interval")?
+                }
+                "--dry-run" => parsed.dry_run = true,
+                "-h" | "--help" => parsed.help = true,
+                other if !other.starts_with('-') => {
+                    if parsed.command.is_some() {
+                        bail!("unexpected argument: {other}");
+                    }
+                    parsed.command = Some(other.to_string());
+                }
+                other => bail!("unknown argument: {other}"),
+            }
+        }
+        Ok(parsed)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct Server {
     name: String,
@@ -60,60 +135,43 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let mut config_path = None;
-    let mut server_name = None;
-    let mut dry_run = false;
-    let mut interval = 2u64;
-    let mut file = None;
-    let mut command = None;
-    let mut remote_path = None;
-    let mut json = false;
-
-    let mut args = env::args().skip(1);
-    while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--config" => config_path = Some(PathBuf::from(args.next().context("--config path")?)),
-            "--server" => server_name = Some(args.next().context("--server name")?),
-            "--file" => file = Some(PathBuf::from(args.next().context("--file path")?)),
-            "--path" => remote_path = Some(args.next().context("--path REMOTE_PATH")?),
-            "--json" => json = true,
-            "--interval" => {
-                interval = args
-                    .next()
-                    .context("--interval seconds")?
-                    .parse()
-                    .context("invalid --interval")?
-            }
-            "--dry-run" => dry_run = true,
-            "-h" | "--help" => {
-                print_help();
-                return Ok(());
-            }
-            other if !other.starts_with('-') => {
-                if command.is_some() {
-                    bail!("unexpected argument: {other}");
-                }
-                command = Some(other.to_string());
-            }
-            other => bail!("unknown argument: {other}"),
-        }
+    let args = Args::parse(env::args().skip(1))?;
+    if args.help {
+        print_help();
+        return Ok(());
     }
 
-    let command =
-        command.context("missing command: check | status | sync | upload | watch | ls")?;
-    let (config, project_root) = load_config(config_path)?;
-    let server = select_server(&config, server_name)?;
+    let command = args.command.clone().context(
+        "missing command: check | status | sync | upload | watch | ls | download | delete",
+    )?;
+    let (config, project_root) = load_config(args.config_path.clone())?;
+    let server = select_server(&config, args.server_name.clone())?;
 
     match command.as_str() {
-        "status" => print_status(&config, &server, &project_root),
-        "check" => check_server(&server, &project_root, dry_run)?,
-        "sync" => sync_server(&server, &project_root, dry_run)?,
+        "status" => print_status(&config, server, &project_root),
+        "check" => check_server(server, &project_root, args.dry_run)?,
+        "sync" => sync_server(server, &project_root, args.dry_run)?,
         "upload" => {
-            let file = file.context("upload requires --file")?;
-            upload_server(&server, &project_root, &file, dry_run)?
+            let file = args.file.clone().context("upload requires --file")?;
+            upload_server(server, &project_root, &file, args.dry_run)?
         }
-        "watch" => watch_server(&server, &project_root, interval)?,
-        "ls" => list_server(&server, remote_path, json)?,
+        "watch" => watch_server(server, &project_root, args.interval)?,
+        "ls" => list_server(server, args.remote_path.clone(), args.json)?,
+        "download" => {
+            let path = args
+                .remote_path
+                .clone()
+                .context("download requires --path")?;
+            let to = args.to.clone().context("download requires --to")?;
+            download_server(server, &path, &to, args.json)?
+        }
+        "delete" => {
+            let path = args
+                .remote_path
+                .clone()
+                .context("delete requires --path")?;
+            delete_server(server, &path, args.recursive, args.allow_delete, args.json)?
+        }
         other => bail!("unknown command: {other}"),
     }
 
@@ -129,7 +187,10 @@ fn print_help() {
            sync              upload all non-excluded files\n\
            upload --file P   upload one file\n\
            watch [--interval N]  poll local files and upload changes\n\
-           ls [--path P] [--json]  list a remote directory\n\n\
+           ls [--path P] [--json]  list a remote directory\n\
+           download --path P --to LOCAL [--json]  fetch a remote file\n\
+           delete --path P [--recursive] --allow-delete [--json]  remove a remote entry\n\n\
+         safety: --path must be relative and stay under remote_root ('..' rejected)\n\
          config: .zed/deploy.json (local_root relative to project root)\n\
          protocols: local, sftp (ssh keys only, no passwords)"
     );
@@ -167,7 +228,7 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     Ok((config, project_root))
 }
 
-fn select_server<'a>(config: &'a Config, requested: Option<String>) -> Result<&'a Server> {
+fn select_server(config: &Config, requested: Option<String>) -> Result<&Server> {
     let name = requested.or_else(|| config.default.clone());
     match name {
         Some(name) => config
@@ -382,6 +443,181 @@ fn build_remote_path(remote_root: &str, path: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn normalize_relative_path(path: &str) -> Result<PathBuf> {
+    if path.starts_with('/') {
+        bail!("--path must be relative, got absolute path: {path}");
+    }
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => bail!("--path must not contain '..': {path}"),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("--path must be relative: {path}")
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        bail!("--path must not be empty");
+    }
+    Ok(normalized)
+}
+
+fn resolve_local_remote_path(remote_root: &str, relative: &Path) -> Result<PathBuf> {
+    let root = PathBuf::from(remote_root);
+    let joined = root.join(relative);
+    let canonical_root = fs::canonicalize(&root)
+        .with_context(|| format!("remote root does not exist: {}", root.display()))?;
+
+    let mut existing = joined.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .with_context(|| format!("cannot resolve {}", joined.display()))?;
+    }
+    let canonical_existing = fs::canonicalize(existing)
+        .with_context(|| format!("cannot resolve {}", existing.display()))?;
+    if !canonical_existing.starts_with(&canonical_root) {
+        bail!("--path escapes remote root: {relative:?}");
+    }
+    Ok(joined)
+}
+
+fn absolute_local_path(to: &Path) -> Result<PathBuf> {
+    if to.is_absolute() {
+        Ok(to.to_path_buf())
+    } else {
+        Ok(env::current_dir()?.join(to))
+    }
+}
+
+fn sftp_remote_path(server: &Server, relative: &Path) -> String {
+    format!(
+        "{}/{}",
+        server.remote_root.trim_end_matches('/'),
+        relative.to_string_lossy().replace('\\', "/")
+    )
+}
+
+fn download_server(server: &Server, path: &str, to: &Path, json: bool) -> Result<()> {
+    let relative = normalize_relative_path(path)?;
+    let target = absolute_local_path(to)?;
+    if target.is_dir() {
+        bail!("refusing to overwrite directory: {}", target.display());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    match server.protocol.as_str() {
+        "local" => {
+            let source = resolve_local_remote_path(&server.remote_root, &relative)?;
+            if !source.exists() {
+                bail!("remote path not found: {path}");
+            }
+            if source.is_dir() {
+                bail!("cannot download a directory: {path}");
+            }
+            fs::copy(&source, &target).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source.display(),
+                    target.display()
+                )
+            })?;
+        }
+        "sftp" => {
+            let remote = sftp_remote_path(server, &relative);
+            let batch = format!(
+                "get \"{remote}\" \"{}\"\n",
+                target.to_string_lossy().replace('"', "\\\"")
+            );
+            run_sftp(server, &batch)?;
+        }
+        other => bail!("unsupported protocol: {other}"),
+    }
+
+    let bytes = fs::metadata(&target)
+        .with_context(|| format!("failed to stat {}", target.display()))?
+        .len();
+    if json {
+        let response = DownloadResponse {
+            server: server.name.clone(),
+            path: path.to_string(),
+            to: target.to_string_lossy().into_owned(),
+            bytes,
+        };
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        println!("downloaded {path} -> {} ({bytes} bytes)", target.display());
+    }
+    Ok(())
+}
+
+fn delete_server(
+    server: &Server,
+    path: &str,
+    recursive: bool,
+    allow_delete: bool,
+    json: bool,
+) -> Result<()> {
+    if !allow_delete {
+        bail!("refusing to delete {path}: pass --allow-delete");
+    }
+    let relative = normalize_relative_path(path)?;
+
+    match server.protocol.as_str() {
+        "local" => {
+            let target = resolve_local_remote_path(&server.remote_root, &relative)?;
+            let metadata = fs::symlink_metadata(&target)
+                .with_context(|| format!("remote path not found: {path}"))?;
+            if metadata.is_dir() {
+                if !recursive {
+                    bail!("refusing to delete directory {path}: pass --recursive");
+                }
+                fs::remove_dir_all(&target)
+                    .with_context(|| format!("failed to delete {}", target.display()))?;
+            } else {
+                fs::remove_file(&target)
+                    .with_context(|| format!("failed to delete {}", target.display()))?;
+            }
+        }
+        "sftp" => {
+            if recursive {
+                bail!("recursive delete is not supported over sftp; delete files individually");
+            }
+            let remote = sftp_remote_path(server, &relative);
+            let probe = run_ssh_capture(
+                server,
+                &format!(
+                    "if [ -d {0} ]; then echo dir; elif [ -e {0} ]; then echo file; else echo missing; fi",
+                    shell_quote(&remote)
+                ),
+            )?;
+            match probe.trim() {
+                "dir" => run_sftp(server, &format!("rmdir \"{remote}\"\n"))?,
+                "file" => run_sftp(server, &format!("rm \"{remote}\"\n"))?,
+                _ => bail!("remote path not found: {path}"),
+            }
+        }
+        other => bail!("unsupported protocol: {other}"),
+    }
+
+    if json {
+        let response = DeleteResponse {
+            server: server.name.clone(),
+            path: path.to_string(),
+            deleted: true,
+        };
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        println!("deleted {path}");
+    }
+    Ok(())
 }
 
 fn sync_server(server: &Server, project_root: &Path, dry_run: bool) -> Result<()> {
@@ -659,4 +895,125 @@ fn run_ssh_capture(server: &Server, remote_command: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn normalize_accepts_relative_files() {
+        assert_eq!(
+            normalize_relative_path("index.php").unwrap(),
+            PathBuf::from("index.php")
+        );
+        assert_eq!(
+            normalize_relative_path("./subdir/nested.php").unwrap(),
+            PathBuf::from("subdir/nested.php")
+        );
+        assert_eq!(
+            normalize_relative_path("a//b/./c").unwrap(),
+            PathBuf::from("a/b/c")
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_absolute_paths() {
+        assert!(normalize_relative_path("/etc/passwd").is_err());
+        assert!(normalize_relative_path("//etc/passwd").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_parent_traversal() {
+        assert!(normalize_relative_path("../etc/passwd").is_err());
+        assert!(normalize_relative_path("subdir/../../etc/passwd").is_err());
+        assert!(normalize_relative_path("a/../b").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_empty_path() {
+        assert!(normalize_relative_path("").is_err());
+        assert!(normalize_relative_path(".").is_err());
+    }
+
+    #[test]
+    fn resolve_local_stays_under_remote_root() {
+        let root = env::temp_dir().join(format!("php-deploy-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("subdir")).unwrap();
+        fs::write(root.join("subdir/nested.php"), b"ok").unwrap();
+
+        let resolved =
+            resolve_local_remote_path(root.to_str().unwrap(), Path::new("subdir/nested.php"))
+                .unwrap();
+        assert_eq!(resolved, root.join("subdir/nested.php"));
+
+        let outside = root.parent().unwrap().join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        assert!(resolve_local_remote_path(
+            root.to_str().unwrap(),
+            Path::new("../elsewhere")
+        )
+        .is_err());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn parse_download_arguments() {
+        let args = Args::parse(strings(&[
+            "--server",
+            "sftp",
+            "download",
+            "--path",
+            "index.php",
+            "--to",
+            "/tmp/remote-download/index.php",
+            "--json",
+        ]))
+        .unwrap();
+        assert_eq!(args.command.as_deref(), Some("download"));
+        assert_eq!(args.server_name.as_deref(), Some("sftp"));
+        assert_eq!(args.remote_path.as_deref(), Some("index.php"));
+        assert_eq!(
+            args.to.unwrap(),
+            PathBuf::from("/tmp/remote-download/index.php")
+        );
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parse_delete_arguments() {
+        let args = Args::parse(strings(&[
+            "delete", "--path", "subdir", "--recursive", "--allow-delete", "--json",
+        ]))
+        .unwrap();
+        assert_eq!(args.command.as_deref(), Some("delete"));
+        assert_eq!(args.remote_path.as_deref(), Some("subdir"));
+        assert!(args.recursive);
+        assert!(args.allow_delete);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn parse_rejects_missing_option_value() {
+        assert!(Args::parse(strings(&["download", "--path"])).is_err());
+        assert!(Args::parse(strings(&["download", "--to"])).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_flag_and_extra_command() {
+        assert!(Args::parse(strings(&["download", "--bogus"])).is_err());
+        assert!(Args::parse(strings(&["download", "delete"])).is_err());
+    }
+
+    #[test]
+    fn help_flag_is_forwarded() {
+        let args = Args::parse(strings(&["--help"])).unwrap();
+        assert!(args.help);
+    }
 }

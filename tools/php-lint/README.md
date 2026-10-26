@@ -16,6 +16,7 @@ cargo build --release
 ```sh
 php-lint check [--dir PATH] [--file PATH] [--level N] [--json]
                [--memory 1G] [--phpstan PATH]
+php-lint --lsp
 ```
 
 | Option | Meaning |
@@ -101,12 +102,22 @@ composer install
 wrong return type, and a call to an undefined method, so the fixture exits `1`
 with three errors.
 
+## LSP mode
+
+`php-lint --lsp` speaks JSON-RPC over stdio with `Content-Length` framing. It
+implements `initialize`, `initialized`, `shutdown`, and `exit`, and publishes
+PHPStan diagnostics on `textDocument/didOpen` and `textDocument/didSave` for
+`.php` files. `didChange` is ignored. The project is found by walking up from
+the file to the nearest `phpstan.neon` or `phpstan.neon.dist`. If PHPStan or
+its configuration is missing, no diagnostics are published and the reason is
+written to stderr.
+
 ## Limitations
 
 - No baseline support or baseline generation; PHPStan's own baseline must be
   configured in `phpstan.neon`.
-- One PHPStan process per invocation, including `--file` runs. There is no
-  long-running server and no incremental in-memory analysis.
+- One PHPStan process per check, including each LSP open/save. There is no
+  incremental in-memory analysis.
 - No incremental cache of our own; PHPStan's result cache is whatever its
   configuration provides.
 - POSIX-oriented discovery (`vendor/bin/phpstan`); Windows `.bat` wrappers are

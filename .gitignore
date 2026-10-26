@@ -11,3 +11,5 @@ fixtures/frameworks/node_modules/
 !fixtures/deploy-test/vendor/
 !fixtures/deploy-test/vendor/ignored.php
 dist/
+extensions/php-lint/target/
+extensions/php-lint/extension.wasm

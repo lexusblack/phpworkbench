@@ -1,0 +1,26 @@
+id = "php-lint"
+name = "PHP Lint"
+version = "0.1.0"
+schema_version = 1
+description = "PHPStan diagnostics language server for PHP files."
+repository = "https://github.com/example/php-lint"
+authors = ["PHP Lint Authors"]
+themes = []
+icon_themes = []
+languages = []
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[grammars]
+
+[language_servers.php_lint]
+languages = ["PHP"]
+
+[language_servers.php_lint.language_ids]
+
+[context_servers]
+
+[slash_commands]

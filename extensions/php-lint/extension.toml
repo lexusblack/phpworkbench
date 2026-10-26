@@ -1,0 +1,11 @@
+id = "php-lint"
+name = "PHP Lint"
+version = "0.1.0"
+schema_version = 1
+description = "PHPStan diagnostics language server for PHP files."
+authors = ["PHP Lint Authors"]
+repository = "https://github.com/example/php-lint"
+
+[language_servers.php_lint]
+name = "PHP Lint"
+languages = ["PHP"]
