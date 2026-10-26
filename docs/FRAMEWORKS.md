@@ -49,7 +49,32 @@ python/rust/typescript/tsx/yaml. PHP, Blade и Vue — всегда расшир
 
 Запуск в Zed: палитра команд → `task: spawn` → `deps: audit`.
 
-Ограничение текущей версии: подсветка строк в `composer.json`/`package.json`
-требует LSP-диагностик. Следующий шаг — `deps-audit --lsp`, который публикует
-`publishDiagnostics` для JSON-файлов, плюс микро-расширение Zed, объявляющее
-сервер для языка JSON.
+Реализованная подсветка: `deps-audit --lsp` публикует `publishDiagnostics`
+для `composer.json` и `package.json`. Расширение `extensions/deps-guard`
+объявляет сервер `deps_guard` для языка JSON, поэтому уязвимые зависимости
+подчёркиваются прямо в файле, а счётчик диагностик виден в статус-баре.
+
+Подключение:
+
+```bash
+cargo install --path tools/deps-audit
+./scripts/install-deps-guard.sh /tmp/zed-test
+```
+
+В настройках проекта:
+
+```json
+{
+  "languages": {
+    "JSON": { "language_servers": ["json-language-server", "deps_guard"] }
+  }
+}
+```
+
+Ограничение: команда расширения использует абсолютный путь
+`/Users/admin/.cargo/bin/deps-audit`. При переносе на другую машину
+поправить `extensions/deps-guard/src/lib.rs` и пересобрать.
+
+Проверено: в `fixtures/deps/composer.json` подчёркнуты laravel/framework,
+symfony/http-foundation, guzzlehttp/guzzle и yiisoft/yii2; в статус-баре 4
+диагностики; сервер запускается Zed как `/Users/admin/.cargo/bin/deps-audit --lsp`.

@@ -4,3 +4,5 @@ target/
 .DS_Store
 .cache/
 .build/
+extensions/deps-guard/target/
+extensions/deps-guard/extension.wasm

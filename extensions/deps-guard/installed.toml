@@ -1,0 +1,26 @@
+id = "deps-guard"
+name = "Deps Guard"
+version = "0.1.0"
+schema_version = 1
+description = "Dependency auditing language server for JSON files."
+repository = "https://github.com/example/deps-guard"
+authors = ["Deps Guard Authors"]
+themes = []
+icon_themes = []
+languages = []
+capabilities = []
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[grammars]
+
+[language_servers.deps_guard]
+languages = ["JSON"]
+
+[language_servers.deps_guard.language_ids]
+
+[context_servers]
+
+[slash_commands]

@@ -77,6 +77,8 @@ cd vendor/zed && cargo run -p zed
   список PHP-файлов проекта с открытием по клику.
 - PHP-тулчейн: PHP 8.5.12, Composer 2.10.3, Xdebug 3.5.3, PHPUnit 13.4.3
   (2 теста проходят).
+- Аудит зависимостей: `deps-audit` (OSV + Packagist/npm) и LSP-расширение
+  `deps-guard` — уязвимые пакеты подчёркиваются в `composer.json`/`package.json`.
 - Фазы 2–6 — `docs/PLAN.md`.
 
 ## Лицензия

@@ -1,0 +1,9 @@
+{
+  "name": "fixture/deps",
+  "require": {
+    "laravel/framework": "8.0.0",
+    "symfony/http-foundation": "5.0.0",
+    "guzzlehttp/guzzle": "7.0.0",
+    "yiisoft/yii2": "2.0.0"
+  }
+}

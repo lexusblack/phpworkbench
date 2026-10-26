@@ -1,0 +1,7 @@
+{
+  "languages": {
+    "JSON": {
+      "language_servers": ["json-language-server", "deps_guard"]
+    }
+  }
+}

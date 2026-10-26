@@ -1,0 +1,11 @@
+id = "deps-guard"
+name = "Deps Guard"
+version = "0.1.0"
+schema_version = 1
+description = "Dependency auditing language server for JSON files."
+authors = ["Deps Guard Authors"]
+repository = "https://github.com/example/deps-guard"
+
+[language_servers.deps_guard]
+name = "Deps Guard"
+languages = ["JSON"]

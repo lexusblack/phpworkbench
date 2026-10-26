@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -68,6 +68,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if env::args().skip(1).any(|argument| argument == "--lsp") {
+        return run_lsp();
+    }
+
     let mut dir = PathBuf::from(".");
     let mut json_output = false;
     let mut args = env::args().skip(1);
@@ -592,4 +596,243 @@ fn print_json(rows: &[Row]) -> Result<()> {
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn run_lsp() -> Result<()> {
+    let stdin = std::io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+
+    while let Some(message) = read_message(&mut reader)? {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let id = message.get("id").cloned();
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+        match method {
+            "initialize" => {
+                write_message(
+                    &mut writer,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "capabilities": { "textDocumentSync": 1 },
+                            "serverInfo": {
+                                "name": "deps-audit",
+                                "version": env!("CARGO_PKG_VERSION"),
+                            },
+                        },
+                    }),
+                )?;
+            }
+            "initialized" => {}
+            "shutdown" => {
+                write_message(
+                    &mut writer,
+                    &json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+                )?;
+            }
+            "exit" => break,
+            "textDocument/didOpen" | "textDocument/didSave" => {
+                if let Err(error) = publish_diagnostics(&mut writer, &params) {
+                    eprintln!("deps-audit lsp: {error:#}");
+                }
+            }
+            _ => {
+                if let Some(id) = id {
+                    write_message(
+                        &mut writer,
+                        &json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_message<R: BufRead>(reader: &mut R) -> Result<Option<Value>> {
+    let mut content_length = None;
+
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+
+    let Some(length) = content_length else {
+        return Ok(None);
+    };
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    Ok(Some(serde_json::from_slice(&body)?))
+}
+
+fn write_message<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
+    let body = serde_json::to_vec(message)?;
+    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
+    let Some(uri) = params
+        .get("textDocument")
+        .and_then(|document| document.get("uri"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let Some(path) = uri_to_path(uri) else {
+        return Ok(());
+    };
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let ecosystem = match file_name {
+        "composer.json" => Ecosystem::Composer,
+        "package.json" => Ecosystem::Npm,
+        _ => return Ok(()),
+    };
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+
+    let text = fs::read_to_string(&path)?;
+    let mut packages = collect_packages(dir)?;
+    packages.retain(|package| package.ecosystem == ecosystem);
+
+    let advisories = query_advisories(&packages)?;
+    let latest = query_latest(&packages);
+    let mut diagnostics = Vec::new();
+
+    for (line_index, line) in text.lines().enumerate() {
+        for package in &packages {
+            let needle = format!("\"{}\"", package.name);
+            let Some(column) = line.find(&needle) else {
+                continue;
+            };
+            let key = (package.ecosystem, package.name.clone());
+            let package_advisories = advisories.get(&key).cloned().unwrap_or_default();
+            let latest_version = latest.get(&key).cloned().flatten();
+
+            if !package_advisories.is_empty() {
+                let mut parts = Vec::new();
+                for advisory in &package_advisories {
+                    let mut part = String::new();
+                    if let Some(severity) = &advisory.severity {
+                        part.push_str(&format!("[{severity}] "));
+                    }
+                    part.push_str(&advisory.id);
+                    if let Some(cve) = advisory
+                        .aliases
+                        .iter()
+                        .find(|alias| alias.starts_with("CVE-"))
+                    {
+                        part.push_str(&format!(" ({cve})"));
+                    }
+                    if let Some(summary) = &advisory.summary {
+                        part.push_str(&format!(": {summary}"));
+                    }
+                    parts.push(part);
+                }
+
+                let mut message = format!(
+                    "{} advisories for {} {}\n{}",
+                    package_advisories.len(),
+                    package.name,
+                    package.version.clone().unwrap_or_default(),
+                    parts.join("\n"),
+                );
+                if let Some(latest) = &latest_version {
+                    message.push_str(&format!("\nlatest: {latest}"));
+                }
+
+                diagnostics.push(diagnostic(
+                    line_index,
+                    column,
+                    needle.len(),
+                    2,
+                    message,
+                ));
+            } else if let (Some(installed), Some(latest_version)) =
+                (&package.version, &latest_version)
+            {
+                let outdated = matches!(
+                    (parse_version(installed), parse_version(latest_version)),
+                    (Some(installed), Some(latest)) if latest > installed
+                );
+                if outdated {
+                    diagnostics.push(diagnostic(
+                        line_index,
+                        column,
+                        needle.len(),
+                        3,
+                        format!("{} {} → {} available", package.name, installed, latest_version),
+                    ));
+                }
+            }
+        }
+    }
+
+    write_message(
+        writer,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": { "uri": uri, "diagnostics": diagnostics },
+        }),
+    )
+}
+
+fn diagnostic(line: usize, column: usize, length: usize, severity: u8, message: String) -> Value {
+    json!({
+        "range": {
+            "start": { "line": line, "character": column },
+            "end": { "line": line, "character": column + length },
+        },
+        "severity": severity,
+        "source": "deps-audit",
+        "message": message,
+    })
+}
+
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let encoded = uri.strip_prefix("file://")?;
+    Some(PathBuf::from(percent_decode(encoded)))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(&input[index + 1..index + 3], 16) {
+                output.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&output).into_owned()
 }
