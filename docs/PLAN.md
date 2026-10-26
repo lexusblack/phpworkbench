@@ -59,6 +59,10 @@ call/type hierarchy и «перейти к тесту» работают.
 
 ## Фаза 3 — панели инструментов (месяцы 3–5)
 
+Статус: движки готовы — `tools/php-db` (SQLite, конфиг, schema/query, guard)
+и `tools/php-http` (`.http`, переменные, env, JSON), `tools/deps-audit`.
+UI-панелей к ним пока нет: это следующий шаг.
+
 - **БД:** подключения (MySQL/PostgreSQL/SQLite), дерево схемы, редактор данных,
   консоль, completion по схеме. Крейт `php_database`, `sqlx`.
 - **HTTP-клиент:** `.http`-файлы, окружения, ассерты, импорт cURL/OpenAPI.

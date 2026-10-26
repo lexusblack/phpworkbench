@@ -1,0 +1,15 @@
+{
+  "connections": [
+    {
+      "name": "app",
+      "driver": "sqlite",
+      "path": "demo.sqlite"
+    },
+    {
+      "name": "pg",
+      "driver": "postgres",
+      "url": "postgres://app@localhost:5432/app",
+      "password_env": "PGPASSWORD"
+    }
+  ]
+}

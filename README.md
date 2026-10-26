@@ -46,6 +46,10 @@ cp profile/keymap.json ~/.config/zed/keymap.json
 `settings/tasks/debug` — проектные, `keymap` — глобальный (Zed не читает keymap
 из проекта). Старый keymap сохраняется в `.bak`.
 
+> Тема `PhpStorm Dark` должна лежать в глобальном каталоге Zed:
+> `mkdir -p ~/.config/zed/themes && cp profile/themes/phpstorm-dark.json ~/.config/zed/themes/`.
+> Без этого `"theme": "PhpStorm Dark"` не загрузится и Zed откатится на дефолтную.
+
 Установи расширение PHP в Zed (`zed: extensions` → PHP) и один из серверов:
 
 ```bash
@@ -81,6 +85,10 @@ cd vendor/zed && cargo run -p zed
   `deps-guard` — уязвимые пакеты подчёркиваются в `composer.json`/`package.json`.
 - Деплой: `php-deploy` — SFTP/local, `sync`, `upload`, `watch`
   (авто-загрузка изменённых файлов). Подробности — `docs/DEPLOY.md`.
+- БД: `php-db` — SQLite (schema/query/JSON, guard от записи), Postgres/MySQL
+  через CLI. HTTP: `php-http` — `.http`-файлы, переменные, env, `--json`.
+- Тема `PhpStorm Dark` (Darcula-палитра) — `profile/themes/`; UX-спека —
+  `design/UX.md`.
 - Фазы 2–6 — `docs/PLAN.md`.
 
 ## Лицензия
