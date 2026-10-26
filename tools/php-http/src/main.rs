@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod postman;
+
 #[derive(Debug, Clone)]
 struct Request {
     name: String,
@@ -25,10 +27,12 @@ struct ExecResult {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    time_ms: u128,
+    size: usize,
 }
 
 fn usage() -> &'static str {
-    "usage:\n  php-http list <file>\n  php-http run <file> --name <request> [--var key=value]... [--env file] [--json] [--follow]\n  php-http run <file> --all [--var key=value]... [--env file] [--json] [--follow]"
+    "usage:\n  php-http list <file>\n  php-http run <file> --name <request> [--var key=value]... [--env file] [--json] [--follow]\n  php-http run <file> --all [--var key=value]... [--env file] [--json] [--follow]\n  php-http collection list <collection.json>\n  php-http collection env <collection.json> --env <environment.json> [--var key=value]...\n  php-http collection run <collection.json> --request <name|id> [--env <environment.json>] [--var key=value]... [--json] [--follow]\n  php-http collection run <collection.json> --all [--env <environment.json>] [--var key=value]... [--json] [--fail-fast] [--follow]"
 }
 
 fn parse_var_line(line: &str) -> Option<(String, String)> {
@@ -267,7 +271,7 @@ fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Resul
         .arg("--output")
         .arg(&body_path)
         .arg("--write-out")
-        .arg("%{http_code}");
+        .arg("%{http_code}|%{time_total}");
     if follow {
         cursor.arg("--location");
     }
@@ -298,14 +302,18 @@ fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Resul
     let headers_raw = fs::read(&headers_path)
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
-    let body = fs::read(&body_path)
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default();
+    let body_bytes = fs::read(&body_path).unwrap_or_default();
+    let size = body_bytes.len();
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
     let _ = fs::remove_dir_all(&dir);
 
-    let mut status = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u16>()
+    let write_out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let mut parts = write_out.split('|');
+    let mut status = parts.next().unwrap_or("").parse::<u16>().unwrap_or(0);
+    let time_ms = parts
+        .next()
+        .and_then(|seconds| seconds.parse::<f64>().ok())
+        .map(|seconds| (seconds * 1000.0).round() as u128)
         .unwrap_or(0);
     let (parsed_status, headers) = parse_response_headers(&headers_raw);
     if status == 0 {
@@ -316,6 +324,8 @@ fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Resul
         status,
         headers,
         body,
+        time_ms,
+        size,
     })
 }
 
@@ -419,6 +429,7 @@ fn main() -> Result<()> {
     }
 
     match args[0].as_str() {
+        "collection" => return postman::run_cli(&args[1..]),
         "list" => {
             let file = args.get(1).context("list requires a .http file")?;
             let doc = load_document(Path::new(file))?;

@@ -14,17 +14,21 @@ php-db - database engine for a PhpStorm-like IDE
 
 Usage:
   php-db [--config PATH] list [--json]
+  php-db [--config PATH] check <connection> [--json]
   php-db [--config PATH] schema <connection> [--json]
   php-db [--config PATH] query <connection> \"<sql>\" [--json] [--allow-write]
+  php-db [--config PATH] exec <connection> \"<command>\" [--allow-write]
 
 Options:
   --config PATH   use this .zed/databases.json instead of walking up from the current directory
   --json          print JSON instead of a table
-  --allow-write   permit destructive statements (drop, truncate, delete)
+  --allow-write   permit destructive statements and exec commands
   -h, --help      show this help
   -V, --version   show the version
 
-Destructive statements are refused with exit code 2 unless --allow-write is given.
+Destructive statements (drop, truncate, delete) are refused with exit code 2
+unless --allow-write is given. `exec` is a write-capable escape hatch and
+always requires --allow-write.
 ";
 
 #[derive(Default)]
@@ -86,6 +90,13 @@ fn run() -> Result<()> {
             let store = Store::load(cli.config.as_deref())?;
             cmd_list(&store, cli.json)
         }
+        "check" => {
+            let [name] = args else {
+                bail!("usage: php-db check <connection> [--json]");
+            };
+            let store = Store::load(cli.config.as_deref())?;
+            cmd_check(&store, name, cli.json)
+        }
         "schema" => {
             let [name] = args else {
                 bail!("usage: php-db schema <connection> [--json]");
@@ -102,6 +113,12 @@ fn run() -> Result<()> {
             };
             let store = Store::load(cli.config.as_deref())?;
             let connection = store.get(name)?;
+            let driver = connection.driver()?;
+            if !driver.is_sql() {
+                bail!(
+                    "`query` is only available for SQL drivers; use `php-db exec {name} \"<command>\" --allow-write` for {driver}"
+                );
+            }
 
             if !cli.allow_write {
                 if let Some(keyword) = guard::destructive_keyword(sql) {
@@ -114,6 +131,28 @@ fn run() -> Result<()> {
 
             let result = db::query(connection, &store.base, sql)?;
             print_query(&result, cli.json);
+            Ok(())
+        }
+        "exec" => {
+            let [name, command] = args else {
+                bail!("usage: php-db exec <connection> \"<command>\" [--allow-write]");
+            };
+            let store = Store::load(cli.config.as_deref())?;
+            let connection = store.get(name)?;
+            let driver = connection.driver()?;
+            if driver.is_sql() {
+                bail!("`exec` is only available for mongodb and redis; use `query` for {driver}");
+            }
+            if !cli.allow_write {
+                return Err(
+                    Refused("refusing to run `exec` without --allow-write".to_string()).into(),
+                );
+            }
+            let output = db::exec(connection, command)?;
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
             Ok(())
         }
         "help" => {
@@ -155,77 +194,60 @@ fn cmd_list(store: &Store, json_output: bool) -> Result<()> {
     let mut entries: Vec<Value> = Vec::new();
 
     for connection in &store.connections {
-        let driver = connection.driver.as_str();
-        let (target, reachable, status, mut status_text, client, client_available, warning) =
-            match driver {
-                "sqlite" => {
-                    let path = connection.sqlite_path(&store.base)?;
-                    let exists = path.is_file();
-                    (
-                        connection.path.clone().unwrap_or_default(),
-                        json!(exists),
-                        if exists { "ok" } else { "missing" }.to_string(),
-                        if exists {
-                            "file exists".to_string()
-                        } else {
-                            format!("file missing ({})", path.display())
-                        },
-                        Value::Null,
-                        Value::Null,
-                        None,
-                    )
-                }
-                driver => {
-                    let bin = if driver == "postgres" {
-                        "psql"
-                    } else {
-                        "mysql"
-                    };
-                    let available = db::client_available(bin);
-                    (
-                        config::redact_url(connection.url.as_deref().unwrap_or("")),
-                        Value::Null,
-                        "configured".to_string(),
-                        format!(
-                            "configured ({bin} {})",
-                            if available { "found" } else { "missing" }
-                        ),
-                        json!(bin),
-                        json!(available),
-                        if connection.url_password().is_some() {
-                            Some("plaintext password in url; use password_env")
-                        } else {
-                            None
-                        },
-                    )
-                }
-            };
+        let driver = connection.driver()?;
+        let client = driver.client();
+        let client_available = db::client_available(client);
+        let target = connection.target();
+        let warnings = connection.warnings();
 
-        if let Some(warning) = warning {
+        let (status, reachable) = match driver {
+            config::Driver::Sqlite => {
+                let path = connection.sqlite_path(&store.base)?;
+                let exists = path.is_file();
+                (
+                    if exists {
+                        "file exists".to_string()
+                    } else {
+                        format!("file missing ({})", path.display())
+                    },
+                    json!(exists),
+                )
+            }
+            _ => (
+                if client_available {
+                    "configured".to_string()
+                } else {
+                    "configured (client missing)".to_string()
+                },
+                Value::Null,
+            ),
+        };
+
+        let mut status_text = status.clone();
+        for warning in &warnings {
             status_text.push_str(&format!("; WARNING: {warning}"));
         }
         rows.push(vec![
             connection.name.clone(),
             connection.driver.clone(),
             target.clone(),
+            format!(
+                "{client} ({})",
+                if client_available { "found" } else { "missing" }
+            ),
             status_text,
         ]);
 
-        let mut entry = json!({
+        entries.push(json!({
             "name": connection.name,
             "driver": connection.driver,
             "target": target,
-            "reachable": reachable,
-            "status": status,
             "client": client,
             "client_available": client_available,
-        });
-        if let Some(warning) = warning {
-            if let Some(object) = entry.as_object_mut() {
-                object.insert("warning".to_string(), json!(warning));
-            }
-        }
-        entries.push(entry);
+            "status": status,
+            "reachable": reachable,
+            "warnings": warnings,
+        }));
     }
 
     if json_output {
@@ -238,9 +260,31 @@ fn cmd_list(store: &Store, json_output: bool) -> Result<()> {
             "NAME".to_string(),
             "DRIVER".to_string(),
             "TARGET".to_string(),
+            "CLIENT".to_string(),
             "STATUS".to_string(),
         ];
         print_table(&headers, &rows);
+    }
+    Ok(())
+}
+
+fn cmd_check(store: &Store, name: &str, json_output: bool) -> Result<()> {
+    let connection = store.get(name)?;
+    let driver = connection.driver()?;
+    let message = db::check(connection, &store.base)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "connection": connection.name,
+                "driver": driver.as_str(),
+                "target": connection.target(),
+                "ok": true,
+                "message": message,
+            }))?
+        );
+    } else {
+        println!("{} ({}): ok ({})", connection.name, driver, message);
     }
     Ok(())
 }

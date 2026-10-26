@@ -1,0 +1,88 @@
+{
+  "info": {
+    "_postman_id": "demo-collection-0001",
+    "name": "Demo API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "host", "value": "http://127.0.0.1:9999" },
+    { "key": "apiVersion", "value": "v1" }
+  ],
+  "item": [
+    {
+      "name": "Items",
+      "variable": [
+        { "key": "itemLimit", "value": "2" }
+      ],
+      "item": [
+        {
+          "id": "req-get-items",
+          "name": "GET items",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json", "type": "text" },
+              { "key": "X-Debug", "value": "1", "type": "text", "disabled": true }
+            ],
+            "url": {
+              "raw": "{{host}}/items?limit={{itemLimit}}&debug=1",
+              "host": ["{{host}}"],
+              "path": ["items"],
+              "query": [
+                { "key": "limit", "value": "{{itemLimit}}" },
+                { "key": "debug", "value": "1", "disabled": true }
+              ]
+            }
+          }
+        },
+        {
+          "id": "req-post-items",
+          "name": "POST items",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json", "type": "text" },
+              { "key": "Accept", "value": "application/json", "type": "text" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"name\":\"demo\"}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": {
+              "raw": "{{host}}/items",
+              "host": ["{{host}}"],
+              "path": ["items"]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{token}}", "type": "string" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Missing",
+      "item": [
+        {
+          "id": "req-missing",
+          "name": "GET missing",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "application/json", "type": "text" }
+            ],
+            "url": {
+              "raw": "{{host}}/missing",
+              "host": ["{{host}}"],
+              "path": ["missing"]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -8,13 +8,29 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
     #[serde(default)]
     default: Option<String>,
     servers: Vec<Server>,
+}
+
+#[derive(Debug, Serialize)]
+struct LsEntry {
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    size: Option<u64>,
+    modified: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct LsResponse {
+    server: String,
+    path: String,
+    entries: Vec<LsEntry>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -50,6 +66,8 @@ fn run() -> Result<()> {
     let mut interval = 2u64;
     let mut file = None;
     let mut command = None;
+    let mut remote_path = None;
+    let mut json = false;
 
     let mut args = env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -57,6 +75,8 @@ fn run() -> Result<()> {
             "--config" => config_path = Some(PathBuf::from(args.next().context("--config path")?)),
             "--server" => server_name = Some(args.next().context("--server name")?),
             "--file" => file = Some(PathBuf::from(args.next().context("--file path")?)),
+            "--path" => remote_path = Some(args.next().context("--path REMOTE_PATH")?),
+            "--json" => json = true,
             "--interval" => {
                 interval = args
                     .next()
@@ -79,7 +99,8 @@ fn run() -> Result<()> {
         }
     }
 
-    let command = command.context("missing command: check | status | sync | upload | watch")?;
+    let command =
+        command.context("missing command: check | status | sync | upload | watch | ls")?;
     let (config, project_root) = load_config(config_path)?;
     let server = select_server(&config, server_name)?;
 
@@ -92,6 +113,7 @@ fn run() -> Result<()> {
             upload_server(&server, &project_root, &file, dry_run)?
         }
         "watch" => watch_server(&server, &project_root, interval)?,
+        "ls" => list_server(&server, remote_path, json)?,
         other => bail!("unknown command: {other}"),
     }
 
@@ -106,7 +128,8 @@ fn print_help() {
            check             validate config and test connectivity\n\
            sync              upload all non-excluded files\n\
            upload --file P   upload one file\n\
-           watch [--interval N]  poll local files and upload changes\n\n\
+           watch [--interval N]  poll local files and upload changes\n\
+           ls [--path P] [--json]  list a remote directory\n\n\
          config: .zed/deploy.json (local_root relative to project root)\n\
          protocols: local, sftp (ssh keys only, no passwords)"
     );
@@ -215,6 +238,150 @@ fn check_server(server: &Server, project_root: &Path, dry_run: bool) -> Result<(
     }
 
     Ok(())
+}
+
+fn list_server(server: &Server, path: Option<String>, json: bool) -> Result<()> {
+    let requested = path.unwrap_or_else(|| ".".to_string());
+    let mut entries = match server.protocol.as_str() {
+        "local" => list_local(server, &requested)?,
+        "sftp" => list_sftp(server, &requested)?,
+        other => bail!("unsupported protocol: {other}"),
+    };
+
+    entries.sort_by(|left, right| {
+        let left_dir = left.kind == "dir";
+        let right_dir = right.kind == "dir";
+        right_dir
+            .cmp(&left_dir)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    if json {
+        let response = LsResponse {
+            server: server.name.clone(),
+            path: requested,
+            entries,
+        };
+        println!("{}", serde_json::to_string(&response)?);
+    } else {
+        for entry in entries {
+            if entry.kind == "dir" {
+                println!("dir  {}", entry.name);
+            } else {
+                println!(
+                    "file {}  {}  {}",
+                    entry.name,
+                    entry
+                        .size
+                        .map(|size| size.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    entry
+                        .modified
+                        .map(|modified| modified.to_string())
+                        .unwrap_or_else(|| "-".to_string())
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn list_local(server: &Server, path: &str) -> Result<Vec<LsEntry>> {
+    let directory = PathBuf::from(&server.remote_root).join(path);
+    let read = fs::read_dir(&directory)
+        .with_context(|| format!("failed to list {}", directory.display()))?;
+
+    let mut entries = Vec::new();
+    for entry in read {
+        let entry = entry.with_context(|| format!("failed to read {}", directory.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat {}", entry.path().display()))?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+        entries.push(LsEntry {
+            name,
+            kind: if metadata.is_dir() {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            },
+            size: Some(metadata.len()),
+            modified,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn list_sftp(server: &Server, path: &str) -> Result<Vec<LsEntry>> {
+    let remote_path = build_remote_path(&server.remote_root, path);
+    let output = run_ssh_capture(server, &format!("ls -1p -- {}", shell_quote(&remote_path)))
+        .with_context(|| format!("failed to list {}", remote_path))?;
+
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let is_dir = line.ends_with('/');
+        let name = line.trim_end_matches('/').to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        entries.push(LsEntry {
+            name,
+            kind: if is_dir {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            },
+            size: None,
+            modified: None,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn build_remote_path(remote_root: &str, path: &str) -> String {
+    let root = remote_root.trim_end_matches('/');
+    let relative = path.trim_start_matches('/');
+    let combined = if root.is_empty() {
+        format!("/{relative}")
+    } else if relative.is_empty() {
+        root.to_string()
+    } else {
+        format!("{root}/{relative}")
+    };
+
+    let mut normalized = String::with_capacity(combined.len());
+    let mut previous_slash = false;
+    for character in combined.chars() {
+        if character == '/' {
+            if !previous_slash {
+                normalized.push(character);
+            }
+            previous_slash = true;
+        } else {
+            normalized.push(character);
+            previous_slash = false;
+        }
+    }
+    normalized
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn sync_server(server: &Server, project_root: &Path, dry_run: bool) -> Result<()> {
@@ -460,6 +627,10 @@ fn run_sftp(server: &Server, batch: &str) -> Result<()> {
 }
 
 fn run_ssh(server: &Server, remote_command: &str) -> Result<()> {
+    run_ssh_capture(server, remote_command).map(|_| ())
+}
+
+fn run_ssh_capture(server: &Server, remote_command: &str) -> Result<String> {
     let host = server.host.as_deref().context("sftp requires host")?;
     let port = server.port.unwrap_or(22).to_string();
     let destination = match server.user.as_deref() {
@@ -487,5 +658,5 @@ fn run_ssh(server: &Server, remote_command: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

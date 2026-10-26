@@ -1,12 +1,16 @@
-//! Database access by shelling out to the platform CLIs (`sqlite3`, `psql`,
-//! `mysql`). No database driver crates are linked.
+//! Database access by shelling out to the official platform CLIs
+//! (`sqlite3`, `psql`, `mysql`, `sqlcmd`, `sqlplus`, `mongosh`, `redis-cli`).
+//! No database driver crates are linked.
 
-use crate::config::{percent_decode, Connection};
+use crate::config::{
+    add_query_param, percent_decode, strip_url_credentials, strip_url_password, Connection, Driver,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
-use std::path::Path;
-use std::process::{Command, Output};
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 pub struct Column {
     pub name: String,
@@ -50,42 +54,330 @@ impl QueryResult {
     }
 }
 
-pub fn client_available(bin: &str) -> bool {
-    match Command::new(bin).arg("--version").output() {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+// ---------------------------------------------------------------------------
+// Client availability
+// ---------------------------------------------------------------------------
+
+/// Finds a client binary on `PATH` (or the supplied search path). Kept separate
+/// from `Command` so tests can exercise a deterministic empty search path.
+pub fn find_executable(bin: &str, search_path: Option<&OsStr>) -> Option<PathBuf> {
+    let path = match search_path {
+        Some(path) => path.to_os_string(),
+        None => std::env::var_os("PATH")?,
+    };
+    for directory in std::env::split_paths(&path) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = directory.join(bin);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
     }
 }
 
-fn require_client(driver: &str, bin: &str) -> Result<()> {
-    if !client_available(bin) {
-        bail!("{driver} support requires the `{bin}` CLI on PATH, but it was not found");
+pub fn client_available(bin: &str) -> bool {
+    find_executable(bin, None).is_some()
+}
+
+pub fn require_client_with(driver: Driver, search_path: Option<&OsStr>) -> Result<()> {
+    let bin = driver.client();
+    if find_executable(bin, search_path).is_none() {
+        bail!(
+            "{} support requires the `{bin}` CLI on PATH, but it was not found",
+            driver.as_str()
+        );
     }
     Ok(())
 }
 
+pub fn require_client(driver: Driver) -> Result<()> {
+    require_client_with(driver, None)
+}
+
+// ---------------------------------------------------------------------------
+// Public operations
+// ---------------------------------------------------------------------------
+
+pub fn check(connection: &Connection, base: &Path) -> Result<String> {
+    let driver = connection.driver()?;
+    require_client(driver)?;
+    let (command, stdin) = build_check_command(connection, base)?;
+    let output = run(command, driver.client(), stdin.as_deref())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match driver {
+        Driver::Sqlite => Ok("file exists".to_string()),
+        Driver::Mongodb => {
+            if stdout.trim() == "1" {
+                Ok("connected".to_string())
+            } else {
+                bail!("mongodb ping returned `{}`", stdout.trim())
+            }
+        }
+        Driver::Redis => {
+            if stdout.trim().eq_ignore_ascii_case("PONG") {
+                Ok("connected".to_string())
+            } else {
+                bail!("redis ping returned `{}`", stdout.trim())
+            }
+        }
+        _ => Ok("connected".to_string()),
+    }
+}
+
 pub fn schema(connection: &Connection, base: &Path) -> Result<Schema> {
-    match connection.driver.as_str() {
-        "sqlite" => sqlite_schema(connection, base),
-        "postgres" => pg_schema(connection),
-        "mysql" => mysql_schema(connection),
-        other => bail!("unsupported driver `{other}`"),
+    let driver = connection.driver()?;
+    require_client(driver)?;
+    match driver {
+        Driver::Sqlite => sqlite_schema(connection, base),
+        Driver::Postgres => {
+            let (command, stdin) = build_schema_command(connection, base)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(schema_from_csv(&text)?)
+        }
+        Driver::Mysql | Driver::MariaDb => {
+            let (command, stdin) = build_schema_command(connection, base)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(schema_from_tsv(&text))
+        }
+        Driver::SqlServer => {
+            let (command, stdin) = build_schema_command(connection, base)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(schema_from_lines(&text))
+        }
+        Driver::Oracle => {
+            let (command, stdin) = build_schema_command(connection, base)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(schema_from_csv(&text)?)
+        }
+        Driver::Mongodb | Driver::Redis => {
+            let (command, stdin) = build_schema_command(connection, base)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(schema_from_lines(&text))
+        }
     }
 }
 
 pub fn query(connection: &Connection, base: &Path, sql: &str) -> Result<QueryResult> {
-    match connection.driver.as_str() {
-        "sqlite" => sqlite_query(connection, base, sql),
-        "postgres" => pg_query(connection, sql),
-        "mysql" => mysql_query(connection, sql),
-        other => bail!("unsupported driver `{other}`"),
+    let driver = connection.driver()?;
+    if !driver.is_sql() {
+        bail!(
+            "{} is not a SQL driver; use `php-db exec {} \"<command>\" --allow-write`",
+            driver,
+            connection.name
+        );
+    }
+    require_client(driver)?;
+    match driver {
+        Driver::Sqlite => sqlite_query(connection, base, sql),
+        Driver::Postgres | Driver::Oracle => {
+            let (command, stdin) = build_query_command(connection, base, sql)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            csv_to_result(&text)
+        }
+        Driver::Mysql | Driver::MariaDb | Driver::SqlServer => {
+            let (command, stdin) = build_query_command(connection, base, sql)?;
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            Ok(tsv_to_result(&text))
+        }
+        Driver::Mongodb | Driver::Redis => unreachable!("non-SQL drivers are handled above"),
     }
 }
 
-fn run(mut command: Command, label: &str) -> Result<Output> {
-    let output = command.output().with_context(|| {
-        format!("failed to run `{label}`; is the client installed and on PATH?")
-    })?;
+pub fn exec(connection: &Connection, command: &str) -> Result<String> {
+    let driver = connection.driver()?;
+    if driver.is_sql() {
+        bail!(
+            "`exec` is only available for mongodb and redis; use `query` for {}",
+            driver
+        );
+    }
+    require_client(driver)?;
+    let (command, stdin) = build_exec_command(connection, command)?;
+    let output = run(command, driver.client(), stdin.as_deref())?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Command construction (public so tests can inspect argv and environment)
+// ---------------------------------------------------------------------------
+
+pub fn build_check_command(
+    connection: &Connection,
+    base: &Path,
+) -> Result<(Command, Option<String>)> {
+    let driver = connection.driver()?;
+    Ok(match driver {
+        Driver::Sqlite => {
+            let path = sqlite_database(connection, base)?;
+            (sqlite_command(&path, "SELECT 1 AS ok"), None)
+        }
+        Driver::Postgres => (pg_command(connection, "SELECT 1 AS ok")?, None),
+        Driver::Mysql | Driver::MariaDb => (mysql_command(connection, "SELECT 1 AS ok")?, None),
+        Driver::SqlServer => (
+            sqlserver_command(connection, "SELECT 1 AS ok", false)?,
+            None,
+        ),
+        Driver::Oracle => {
+            let target = oracle_target(connection)?;
+            (
+                sqlplus_command(),
+                Some(oracle_script(&target, "SELECT 1 AS ok FROM dual")),
+            )
+        }
+        Driver::Mongodb => (
+            mongodb_command(connection, "print(db.runCommand({ ping: 1 }).ok)")?,
+            None,
+        ),
+        Driver::Redis => (redis_command(connection, &["PING"])?, None),
+    })
+}
+
+pub fn build_schema_command(
+    connection: &Connection,
+    base: &Path,
+) -> Result<(Command, Option<String>)> {
+    let driver = connection.driver()?;
+    Ok(match driver {
+        Driver::Sqlite => {
+            let path = sqlite_database(connection, base)?;
+            (
+                sqlite_command(
+                    &path,
+                    "SELECT name FROM sqlite_master WHERE type = 'table' \
+                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                ),
+                None,
+            )
+        }
+        Driver::Postgres => (pg_command(connection, PG_SCHEMA_SQL)?, None),
+        Driver::Mysql | Driver::MariaDb => (mysql_command(connection, "SHOW TABLES")?, None),
+        Driver::SqlServer => (
+            sqlserver_command(connection, SQLSERVER_SCHEMA_SQL, false)?,
+            None,
+        ),
+        Driver::Oracle => {
+            let target = oracle_target(connection)?;
+            (
+                sqlplus_command(),
+                Some(oracle_script(
+                    &target,
+                    "SELECT table_name FROM user_tables ORDER BY table_name",
+                )),
+            )
+        }
+        Driver::Mongodb => (
+            mongodb_command(
+                connection,
+                "db.getCollectionNames().sort().forEach(n => print(n))",
+            )?,
+            None,
+        ),
+        Driver::Redis => (
+            redis_command(connection, &["--scan", "--count", "100"])?,
+            None,
+        ),
+    })
+}
+
+pub fn build_query_command(
+    connection: &Connection,
+    base: &Path,
+    sql: &str,
+) -> Result<(Command, Option<String>)> {
+    let driver = connection.driver()?;
+    Ok(match driver {
+        Driver::Sqlite => {
+            let path = sqlite_database(connection, base)?;
+            (sqlite_command(&path, sql), None)
+        }
+        Driver::Postgres => (pg_command(connection, sql)?, None),
+        Driver::Mysql | Driver::MariaDb => (mysql_command(connection, sql)?, None),
+        Driver::SqlServer => (sqlserver_command(connection, sql, true)?, None),
+        Driver::Oracle => {
+            let target = oracle_target(connection)?;
+            (sqlplus_command(), Some(oracle_script(&target, sql)))
+        }
+        Driver::Mongodb | Driver::Redis => bail!(
+            "`query` is only available for SQL drivers; use `exec` for {}",
+            driver
+        ),
+    })
+}
+
+pub fn build_exec_command(
+    connection: &Connection,
+    command: &str,
+) -> Result<(Command, Option<String>)> {
+    let driver = connection.driver()?;
+    Ok(match driver {
+        Driver::Mongodb => (mongodb_command(connection, command)?, None),
+        Driver::Redis => {
+            let args = split_command(command);
+            if args.is_empty() {
+                bail!("redis exec needs a command");
+            }
+            (redis_command(connection, &args)?, None)
+        }
+        _ => bail!(
+            "`exec` is only available for mongodb and redis; use `query` for {}",
+            driver
+        ),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Process execution
+// ---------------------------------------------------------------------------
+
+fn run(mut command: Command, label: &str, stdin: Option<&str>) -> Result<Output> {
+    let output = match stdin {
+        Some(input) => {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().with_context(|| {
+                format!("failed to run `{label}`; is the client installed and on PATH?")
+            })?;
+            if let Some(mut pipe) = child.stdin.take() {
+                pipe.write_all(input.as_bytes())
+                    .with_context(|| format!("failed to send input to `{label}`"))?;
+            }
+            child
+                .wait_with_output()
+                .with_context(|| format!("failed to wait for `{label}`"))?
+        }
+        None => command.output().with_context(|| {
+            format!("failed to run `{label}`; is the client installed and on PATH?")
+        })?,
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
@@ -106,7 +398,7 @@ fn run(mut command: Command, label: &str) -> Result<Output> {
 // SQLite
 // ---------------------------------------------------------------------------
 
-fn sqlite_database(connection: &Connection, base: &Path) -> Result<std::path::PathBuf> {
+fn sqlite_database(connection: &Connection, base: &Path) -> Result<PathBuf> {
     let path = connection.sqlite_path(base)?;
     if !path.is_file() {
         bail!(
@@ -117,8 +409,20 @@ fn sqlite_database(connection: &Connection, base: &Path) -> Result<std::path::Pa
     Ok(path)
 }
 
+fn sqlite_command(path: &Path, sql: &str) -> Command {
+    let mut command = Command::new("sqlite3");
+    command.arg("-json").arg(path).arg(sql);
+    command
+}
+
 fn sqlite_schema(connection: &Connection, base: &Path) -> Result<Schema> {
-    let path = sqlite_database(connection, base)?;
+    let path = connection.sqlite_path(base)?;
+    if !path.is_file() {
+        bail!(
+            "sqlite database not found: {} (php-db never creates a database)",
+            path.display()
+        );
+    }
     let table_rows = sqlite_rows(
         &path,
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
@@ -150,7 +454,13 @@ fn sqlite_schema(connection: &Connection, base: &Path) -> Result<Schema> {
 }
 
 fn sqlite_query(connection: &Connection, base: &Path, sql: &str) -> Result<QueryResult> {
-    let path = sqlite_database(connection, base)?;
+    let path = connection.sqlite_path(base)?;
+    if !path.is_file() {
+        bail!(
+            "sqlite database not found: {} (php-db never creates a database)",
+            path.display()
+        );
+    }
     let rows = sqlite_rows(&path, sql)?;
     let columns: Vec<String> = rows
         .first()
@@ -169,9 +479,7 @@ fn sqlite_query(connection: &Connection, base: &Path, sql: &str) -> Result<Query
 }
 
 fn sqlite_rows(path: &Path, sql: &str) -> Result<Vec<Map<String, Value>>> {
-    let mut command = Command::new("sqlite3");
-    command.arg("-json").arg(path).arg(sql);
-    let output = run(command, "sqlite3")?;
+    let output = run(sqlite_command(path, sql), "sqlite3", None)?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -213,140 +521,90 @@ fn integer_field(row: &Map<String, Value>, key: &str) -> i64 {
 // ---------------------------------------------------------------------------
 
 const PG_SCHEMA_SQL: &str = "\
-SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default,
-       EXISTS (
-           SELECT 1
-           FROM information_schema.table_constraints tc
-           JOIN information_schema.key_column_usage kcu
-             ON kcu.constraint_name = tc.constraint_name
-            AND kcu.table_schema = tc.table_schema
-            AND kcu.table_name = tc.table_name
-           WHERE tc.constraint_type = 'PRIMARY KEY'
-             AND kcu.table_schema = c.table_schema
-             AND kcu.table_name = c.table_name
-             AND kcu.column_name = c.column_name
-       ) AS is_pk
-FROM information_schema.columns c
-JOIN information_schema.tables t
-  ON t.table_schema = c.table_schema
- AND t.table_name = c.table_name
-WHERE t.table_type = 'BASE TABLE'
-  AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
-ORDER BY c.table_schema, c.table_name, c.ordinal_position";
+SELECT CASE
+         WHEN table_schema = 'public' THEN table_name
+         ELSE table_schema || '.' || table_name
+       END AS name
+FROM information_schema.tables
+WHERE table_type = 'BASE TABLE'
+  AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY 1";
+
+fn pg_url(connection: &Connection) -> Result<String> {
+    let url = match connection.url.as_deref() {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => {
+            let host = connection
+                .host
+                .as_deref()
+                .context("postgres connection is missing `host`")?;
+            let port = connection.port.unwrap_or(5432);
+            let user = connection.user.as_deref().unwrap_or("");
+            let mut url = format!("postgresql://{user}@{host}:{port}");
+            if let Some(database) = connection.database.as_deref() {
+                if !database.is_empty() {
+                    url.push('/');
+                    url.push_str(database);
+                }
+            }
+            url
+        }
+    };
+    Ok(url)
+}
 
 fn pg_command(connection: &Connection, sql: &str) -> Result<Command> {
-    let url = connection
-        .url
-        .as_deref()
-        .context("postgres connection is missing `url`")?;
+    let password = connection.password()?;
+    let (url, _) = strip_url_password(&pg_url(connection)?);
+    let url = match connection.sslmode.as_deref() {
+        Some(sslmode) if !sslmode.is_empty() => add_query_param(&url, "sslmode", sslmode),
+        _ => url,
+    };
+
     let mut command = Command::new("psql");
     command
         .arg(url)
         .arg("-X")
-        .arg("--csv")
         .arg("-v")
         .arg("ON_ERROR_STOP=1")
-        .arg("-c")
-        .arg(sql);
-    if let Some(password) = connection.password()? {
+        .arg("--csv");
+    if let Some(password) = password {
         command.env("PGPASSWORD", password);
     }
+    command.arg("-c").arg(sql);
     Ok(command)
 }
 
-fn pg_schema(connection: &Connection) -> Result<Schema> {
-    require_client("postgres", "psql")?;
-    let output = run(pg_command(connection, PG_SCHEMA_SQL)?, "psql")?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let records = parse_csv(&text)?;
-    if records.is_empty() {
-        return Ok(Schema { tables: Vec::new() });
-    }
-
-    let mut tables: Vec<Table> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    for record in records.iter().skip(1) {
-        let schema_name = field(record, 0);
-        let table_name = field(record, 1);
-        if table_name.is_empty() {
-            continue;
-        }
-        let key = format!("{schema_name}\u{1f}{table_name}");
-        let table_index = *index.entry(key).or_insert_with(|| {
-            tables.push(Table {
-                name: if schema_name == "public" {
-                    table_name.to_string()
-                } else {
-                    format!("{schema_name}.{table_name}")
-                },
-                columns: Vec::new(),
-            });
-            tables.len() - 1
-        });
-        let nullable = field(record, 4);
-        tables[table_index].columns.push(Column {
-            name: field(record, 2).to_string(),
-            kind: field(record, 3).to_string(),
-            not_null: nullable.eq_ignore_ascii_case("NO"),
-            primary_key: matches!(field(record, 6), "t" | "true" | "1"),
-            default: record.get(5).cloned().flatten(),
-        });
-    }
-    Ok(Schema { tables })
-}
-
-fn pg_query(connection: &Connection, sql: &str) -> Result<QueryResult> {
-    require_client("postgres", "psql")?;
-    let output = run(pg_command(connection, sql)?, "psql")?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    csv_to_result(&text)
-}
-
-fn field(record: &[Option<String>], index: usize) -> &str {
-    record
-        .get(index)
-        .and_then(|value| value.as_deref())
-        .unwrap_or("")
-}
-
 // ---------------------------------------------------------------------------
-// MySQL
+// MySQL / MariaDB
 // ---------------------------------------------------------------------------
 
-const MYSQL_SCHEMA_SQL: &str = "\
-SELECT c.table_name, c.column_name, c.column_type, c.is_nullable, c.column_default,
-       (c.column_key = 'PRI') AS is_pk
-FROM information_schema.columns c
-JOIN information_schema.tables t
-  ON t.table_schema = c.table_schema
- AND t.table_name = c.table_name
-WHERE c.table_schema = DATABASE()
-  AND t.table_type = 'BASE TABLE'
-ORDER BY c.table_name, c.ordinal_position";
-
-struct MysqlTarget {
+struct UrlTarget {
     host: String,
     port: Option<u16>,
     user: Option<String>,
     password: Option<String>,
-    database: String,
+    database: Option<String>,
 }
 
-fn parse_mysql_url(url: &str) -> Result<MysqlTarget> {
-    let rest = url
-        .strip_prefix("mysql://")
-        .with_context(|| format!("mysql url must start with mysql://: {url}"))?;
-    let (authority, database_part) = rest
-        .split_once('/')
-        .context("mysql url must include a database name")?;
-    let database = database_part
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    if database.is_empty() {
-        bail!("mysql url must include a database name");
+fn parse_url_target(url: &str, schemes: &[&str]) -> Result<UrlTarget> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .with_context(|| format!("url must include a scheme: {url}"))?;
+    if !schemes.contains(&scheme) {
+        bail!(
+            "url scheme `{scheme}` is not supported here (expected {})",
+            schemes.join(", ")
+        );
     }
+    let (authority, tail) = match rest.split_once('/') {
+        Some((authority, tail)) => (authority, Some(tail)),
+        None => (rest, None),
+    };
+    let database = tail
+        .and_then(|tail| tail.split(['?', '#']).next())
+        .filter(|database| !database.is_empty())
+        .map(str::to_string);
 
     let (userinfo, host_port) = match authority.rsplit_once('@') {
         Some((userinfo, host_port)) => (Some(userinfo), host_port),
@@ -360,13 +618,13 @@ fn parse_mysql_url(url: &str) -> Result<MysqlTarget> {
         None => (None, None),
     };
     if user.as_deref() == Some("") {
-        bail!("mysql url has an empty user name");
+        bail!("url has an empty user name");
     }
     let (host, port) = split_host_port(host_port)?;
     if host.is_empty() {
-        bail!("mysql url is missing a host");
+        bail!("url is missing a host");
     }
-    Ok(MysqlTarget {
+    Ok(UrlTarget {
         host,
         port,
         user,
@@ -375,13 +633,21 @@ fn parse_mysql_url(url: &str) -> Result<MysqlTarget> {
     })
 }
 
+fn parse_mysql_url(url: &str) -> Result<UrlTarget> {
+    let target = parse_url_target(url, &["mysql"])?;
+    if target.database.is_none() {
+        bail!("mysql url must include a database name");
+    }
+    Ok(target)
+}
+
 fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
     if let Some(rest) = value.strip_prefix('[') {
         let (host, tail) = rest
             .split_once(']')
-            .context("mysql url has an unterminated IPv6 host")?;
+            .context("url has an unterminated IPv6 host")?;
         let port = match tail.strip_prefix(':') {
-            Some(port) => Some(port.parse().context("mysql url has an invalid port")?),
+            Some(port) => Some(port.parse().context("url has an invalid port")?),
             None => None,
         };
         return Ok((host.to_string(), port));
@@ -389,87 +655,509 @@ fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
     match value.rsplit_once(':') {
         Some((host, port)) => Ok((
             host.to_string(),
-            Some(port.parse().context("mysql url has an invalid port")?),
+            Some(port.parse().context("url has an invalid port")?),
         )),
         None => Ok((value.to_string(), None)),
     }
 }
 
-fn mysql_command(connection: &Connection, sql: &str) -> Result<Command> {
-    let url = connection
-        .url
-        .as_deref()
-        .context("mysql connection is missing `url`")?;
-    let target = parse_mysql_url(url)?;
+struct MysqlTarget {
+    host: Option<String>,
+    port: Option<u16>,
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+    socket: Option<String>,
+    ssl: bool,
+}
 
+fn mysql_target(connection: &Connection) -> Result<MysqlTarget> {
+    let mut target = MysqlTarget {
+        host: connection.host.clone(),
+        port: connection.port,
+        user: connection.user.clone(),
+        password: connection.password()?,
+        database: connection.database.clone(),
+        socket: connection.socket.clone(),
+        ssl: connection.ssl.unwrap_or(false),
+    };
+    if let Some(url) = connection.url.as_deref().filter(|url| !url.is_empty()) {
+        let parsed = parse_mysql_url(url)?;
+        target.host.get_or_insert(parsed.host);
+        if target.port.is_none() {
+            target.port = parsed.port;
+        }
+        if target.user.is_none() {
+            target.user = parsed.user;
+        }
+        if target.password.is_none() {
+            target.password = parsed.password;
+        }
+        if target.database.is_none() {
+            target.database = parsed.database;
+        }
+    }
+    if target.host.is_none() && target.socket.is_none() {
+        bail!("mysql connection needs a host or socket");
+    }
+    Ok(target)
+}
+
+fn mysql_command(connection: &Connection, sql: &str) -> Result<Command> {
+    let driver = connection.driver()?;
+    let target = mysql_target(connection)?;
     let mut command = Command::new("mysql");
-    command
-        .arg("--batch")
-        .arg("--raw")
-        .arg("-h")
-        .arg(&target.host);
-    if let Some(port) = target.port {
-        command.arg("-P").arg(port.to_string());
+    command.arg("--batch").arg("--raw");
+
+    if let Some(socket) = &target.socket {
+        command.arg("--socket").arg(socket);
+    } else {
+        command
+            .arg("-h")
+            .arg(target.host.as_deref().unwrap_or("localhost"));
+        if let Some(port) = target.port {
+            command.arg("-P").arg(port.to_string());
+        }
     }
     if let Some(user) = &target.user {
         command.arg("-u").arg(user);
     }
-    command.arg("-D").arg(&target.database);
-
+    if let Some(database) = &target.database {
+        command.arg("-D").arg(database);
+    }
+    if target.ssl {
+        if driver == Driver::Mysql {
+            command.arg("--ssl-mode=REQUIRED");
+        } else {
+            command.arg("--ssl");
+        }
+    }
     // MYSQL_PWD keeps the password out of the process arguments.
-    let password = match connection.password()? {
-        Some(password) => Some(password),
-        None => target.password,
-    };
-    if let Some(password) = password {
+    if let Some(password) = target.password {
         command.env("MYSQL_PWD", password);
     }
     command.arg("-e").arg(sql);
     Ok(command)
 }
 
-fn mysql_schema(connection: &Connection) -> Result<Schema> {
-    require_client("mysql", "mysql")?;
-    let output = run(mysql_command(connection, MYSQL_SCHEMA_SQL)?, "mysql")?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let result = tsv_to_result(&text);
+// ---------------------------------------------------------------------------
+// SQL Server
+// ---------------------------------------------------------------------------
 
-    let mut tables: Vec<Table> = Vec::new();
-    let mut index: HashMap<String, usize> = HashMap::new();
-    for row in &result.rows {
-        let table_name = cell(row, 0);
-        if table_name.is_empty() {
-            continue;
-        }
-        let table_index = *index.entry(table_name.clone()).or_insert_with(|| {
-            tables.push(Table {
-                name: table_name.clone(),
-                columns: Vec::new(),
-            });
-            tables.len() - 1
-        });
-        let nullable = cell(row, 3);
-        tables[table_index].columns.push(Column {
-            name: cell(row, 1),
-            kind: cell(row, 2),
-            not_null: nullable.eq_ignore_ascii_case("NO"),
-            primary_key: cell(row, 5) == "1",
-            default: cell_opt(row, 4),
-        });
-    }
-    Ok(Schema { tables })
+const SQLSERVER_SCHEMA_SQL: &str = "\
+SET NOCOUNT ON;
+SELECT CASE
+         WHEN TABLE_SCHEMA = 'dbo' THEN TABLE_NAME
+         ELSE TABLE_SCHEMA + '.' + TABLE_NAME
+       END AS name
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE = 'BASE TABLE'
+ORDER BY name";
+
+struct SqlServerTarget {
+    host: String,
+    port: Option<u16>,
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+    ssl: bool,
 }
 
-fn mysql_query(connection: &Connection, sql: &str) -> Result<QueryResult> {
-    require_client("mysql", "mysql")?;
-    let output = run(mysql_command(connection, sql)?, "mysql")?;
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    Ok(tsv_to_result(&text))
+fn sqlserver_target(connection: &Connection) -> Result<SqlServerTarget> {
+    let mut target = SqlServerTarget {
+        host: connection.host.clone().unwrap_or_default(),
+        port: connection.port,
+        user: connection.user.clone(),
+        password: connection.password()?,
+        database: connection.database.clone(),
+        ssl: connection.ssl.unwrap_or(false),
+    };
+    if let Some(url) = connection.url.as_deref().filter(|url| !url.is_empty()) {
+        let parsed = parse_url_target(url, &["sqlserver", "mssql"])?;
+        target.host = parsed.host;
+        if target.port.is_none() {
+            target.port = parsed.port;
+        }
+        if target.user.is_none() {
+            target.user = parsed.user;
+        }
+        if target.password.is_none() {
+            target.password = parsed.password;
+        }
+        if target.database.is_none() {
+            target.database = parsed.database;
+        }
+    }
+    if target.host.is_empty() {
+        bail!("sqlserver connection needs a host");
+    }
+    Ok(target)
+}
+
+fn sqlserver_command(connection: &Connection, sql: &str, headers: bool) -> Result<Command> {
+    let target = sqlserver_target(connection)?;
+    let mut command = Command::new("sqlcmd");
+    command
+        .arg("-S")
+        .arg(format!("{},{}", target.host, target.port.unwrap_or(1433)));
+    if let Some(user) = &target.user {
+        command.arg("-U").arg(user);
+    }
+    if let Some(database) = &target.database {
+        command.arg("-d").arg(database);
+    }
+    if let Some(password) = &target.password {
+        // SQLCMDPASSWORD keeps the password out of the process arguments.
+        command.env("SQLCMDPASSWORD", password);
+    }
+    command.arg("-b");
+    if !headers {
+        command.arg("-h").arg("-1");
+    }
+    command.arg("-W").arg("-w").arg("65535").arg("-s").arg("\t");
+    if target.ssl {
+        command.arg("-C");
+    }
+    command.arg("-Q").arg(format!("SET NOCOUNT ON;\n{sql}"));
+    Ok(command)
+}
+
+// ---------------------------------------------------------------------------
+// Oracle
+// ---------------------------------------------------------------------------
+
+struct OracleTarget {
+    user: String,
+    password: Option<String>,
+    connect: String,
+}
+
+fn oracle_target(connection: &Connection) -> Result<OracleTarget> {
+    let raw = match connection.url.as_deref() {
+        Some(url) if !url.is_empty() => url.to_string(),
+        _ => format!(
+            "{}@{}:{}/{}",
+            connection.user.as_deref().unwrap_or(""),
+            connection
+                .host
+                .as_deref()
+                .context("oracle connection needs a host")?,
+            connection.port.unwrap_or(1521),
+            connection.database.as_deref().unwrap_or("")
+        ),
+    };
+    let (userinfo, connect) = raw
+        .split_once('@')
+        .with_context(|| format!("oracle url must look like user@host:port/service: {raw}"))?;
+    let (user, embedded) = match userinfo.split_once('/') {
+        Some((user, password)) => (percent_decode(user), Some(percent_decode(password))),
+        None => match userinfo.split_once(':') {
+            Some((user, password)) => (percent_decode(user), Some(percent_decode(password))),
+            None => (percent_decode(userinfo), None),
+        },
+    };
+    if user.is_empty() {
+        bail!("oracle connection needs a user");
+    }
+    let password = match connection.password_env {
+        Some(_) => connection.password()?,
+        None => embedded,
+    };
+    let connect = if connect.starts_with("//") {
+        connect.to_string()
+    } else {
+        format!("//{connect}")
+    };
+    Ok(OracleTarget {
+        user,
+        password,
+        connect,
+    })
+}
+
+fn sqlplus_command() -> Command {
+    let mut command = Command::new("sqlplus");
+    command.arg("-S").arg("-L").arg("/nolog");
+    command
+}
+
+fn oracle_script(target: &OracleTarget, sql: &str) -> String {
+    let mut script = String::new();
+    script.push_str("WHENEVER SQLERROR EXIT SQL.SQLCODE\n");
+    script.push_str("SET MARKUP CSV ON DELIMITER , QUOTE ON\n");
+    script.push_str("SET FEEDBACK OFF\nSET VERIFY OFF\n");
+    match &target.password {
+        Some(password) => script.push_str(&format!(
+            "CONNECT {}/\"{}\"@{}\n",
+            target.user,
+            password.replace('"', "\"\""),
+            target.connect
+        )),
+        None => script.push_str(&format!("CONNECT {}@{}\n", target.user, target.connect)),
+    }
+    let trimmed = sql.trim();
+    script.push_str(trimmed);
+    if !trimmed.ends_with(';') && !trimmed.ends_with('/') {
+        script.push(';');
+    }
+    script.push_str("\nEXIT\n");
+    script
+}
+
+// ---------------------------------------------------------------------------
+// MongoDB
+// ---------------------------------------------------------------------------
+
+const MONGO_AUTH: &str = "\
+const __u = process.env.PHP_DB_MONGO_USER;
+const __p = process.env.PHP_DB_MONGO_PASSWORD;
+if (__u && __p) { db.auth(__u, __p); }";
+
+struct MongoTarget {
+    uri: String,
+    user: Option<String>,
+    password: Option<String>,
+}
+
+fn mongodb_target(connection: &Connection) -> Result<MongoTarget> {
+    let user = connection
+        .user
+        .clone()
+        .or_else(|| connection.url_username());
+    let password = connection.password()?;
+    let uri = match connection.url.as_deref() {
+        Some(url) if !url.is_empty() => strip_url_credentials(url),
+        _ => format!(
+            "mongodb://{}:{}/{}",
+            connection.host.as_deref().unwrap_or("localhost"),
+            connection.port.unwrap_or(27017),
+            connection.database.as_deref().unwrap_or("")
+        ),
+    };
+    Ok(MongoTarget {
+        uri,
+        user,
+        password,
+    })
+}
+
+fn mongodb_command(connection: &Connection, script: &str) -> Result<Command> {
+    let target = mongodb_target(connection)?;
+    let script = format!("{MONGO_AUTH}\n{script}");
+    let mut command = Command::new("mongosh");
+    command
+        .arg(&target.uri)
+        .arg("--quiet")
+        .arg("--eval")
+        .arg(script);
+    if let Some(user) = target.user {
+        command.env("PHP_DB_MONGO_USER", user);
+    }
+    if let Some(password) = target.password {
+        command.env("PHP_DB_MONGO_PASSWORD", password);
+    }
+    Ok(command)
+}
+
+// ---------------------------------------------------------------------------
+// Redis
+// ---------------------------------------------------------------------------
+
+struct RedisTarget {
+    host: String,
+    port: u16,
+    socket: Option<String>,
+    db: Option<u32>,
+    user: Option<String>,
+    password: Option<String>,
+    tls: bool,
+}
+
+fn redis_target(connection: &Connection) -> Result<RedisTarget> {
+    let mut target = RedisTarget {
+        host: connection
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: connection.port.unwrap_or(6379),
+        socket: connection.socket.clone(),
+        db: None,
+        user: connection.user.clone(),
+        password: connection.password()?,
+        tls: connection.ssl.unwrap_or(false),
+    };
+    if let Some(url) = connection.url.as_deref().filter(|url| !url.is_empty()) {
+        let (scheme, rest) = url
+            .split_once("://")
+            .with_context(|| format!("redis url must include a scheme: {url}"))?;
+        match scheme {
+            "redis" => {}
+            "rediss" => target.tls = true,
+            other => {
+                bail!("redis url scheme `{other}` is not supported (expected redis or rediss)")
+            }
+        }
+        let (authority, tail) = match rest.split_once('/') {
+            Some((authority, tail)) => (authority, Some(tail)),
+            None => (rest, None),
+        };
+        if let Some(db) = tail
+            .and_then(|tail| tail.split(['?', '#']).next())
+            .filter(|db| !db.is_empty())
+        {
+            target.db = Some(
+                db.parse()
+                    .context("redis url has an invalid database number")?,
+            );
+        }
+        let (userinfo, host_port) = match authority.rsplit_once('@') {
+            Some((userinfo, host_port)) => (Some(userinfo), host_port),
+            None => (None, authority),
+        };
+        if let Some(userinfo) = userinfo {
+            let (user, password) = match userinfo.split_once(':') {
+                Some((user, password)) => (
+                    (!user.is_empty()).then(|| percent_decode(user)),
+                    (!password.is_empty()).then(|| percent_decode(password)),
+                ),
+                None => (Some(percent_decode(userinfo)), None),
+            };
+            if target.user.is_none() {
+                target.user = user;
+            }
+            if target.password.is_none() {
+                target.password = password;
+            }
+        }
+        let (host, port) = split_host_port(host_port)?;
+        target.host = host;
+        if let Some(port) = port {
+            target.port = port;
+        }
+    }
+    Ok(target)
+}
+
+fn redis_command<T: AsRef<OsStr>>(connection: &Connection, args: &[T]) -> Result<Command> {
+    let target = redis_target(connection)?;
+    let mut command = Command::new("redis-cli");
+    if let Some(socket) = &target.socket {
+        command.arg("-s").arg(socket);
+    } else {
+        command.arg("-h").arg(&target.host);
+        command.arg("-p").arg(target.port.to_string());
+    }
+    if let Some(db) = target.db {
+        command.arg("-n").arg(db.to_string());
+    }
+    if let Some(user) = &target.user {
+        command.arg("--user").arg(user);
+    }
+    if target.tls {
+        command.arg("--tls");
+    }
+    command.arg("--no-auth-warning");
+    // REDISCLI_AUTH keeps the password out of the process arguments.
+    if let Some(password) = target.password {
+        command.env("REDISCLI_AUTH", password);
+    }
+    command.args(args);
+    Ok(command)
+}
+
+/// Splits a redis command string into argv, honouring single and double quotes
+/// and backslash escapes.
+pub fn split_command(command: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in command.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(active) => {
+                if character == '\\' {
+                    escaped = true;
+                } else if character == active {
+                    quote = None;
+                } else {
+                    current.push(character);
+                }
+            }
+            None => match character {
+                '\\' => escaped = true,
+                '\'' | '"' => quote = Some(character),
+                character if character.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                character => current.push(character),
+            },
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 // ---------------------------------------------------------------------------
 // Output parsing
 // ---------------------------------------------------------------------------
+
+fn schema_from_csv(text: &str) -> Result<Schema> {
+    let result = csv_to_result(text)?;
+    Ok(Schema {
+        tables: result
+            .rows
+            .iter()
+            .filter_map(|row| row.first())
+            .filter_map(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| Table {
+                name: name.to_string(),
+                columns: Vec::new(),
+            })
+            .collect(),
+    })
+}
+
+fn schema_from_tsv(text: &str) -> Schema {
+    let result = tsv_to_result(text);
+    Schema {
+        tables: result
+            .rows
+            .iter()
+            .filter_map(|row| row.first())
+            .filter_map(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(|name| Table {
+                name: name.to_string(),
+                columns: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn schema_from_lines(text: &str) -> Schema {
+    Schema {
+        tables: text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.starts_with('('))
+            .map(|name| Table {
+                name: name.to_string(),
+                columns: Vec::new(),
+            })
+            .collect(),
+    }
+}
 
 fn csv_to_result(text: &str) -> Result<QueryResult> {
     let records = parse_csv(text)?;
@@ -629,25 +1317,220 @@ fn tsv_to_result(text: &str) -> QueryResult {
     QueryResult { columns, rows }
 }
 
-fn cell(row: &[Value], index: usize) -> String {
-    match row.get(index) {
-        Some(Value::String(value)) => value.clone(),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => other.to_string(),
-    }
-}
-
-fn cell_opt(row: &[Value], index: usize) -> Option<String> {
-    match row.get(index) {
-        Some(Value::String(value)) => Some(value.clone()),
-        Some(Value::Null) | None => None,
-        Some(other) => Some(other.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection(json: &str) -> Connection {
+        serde_json::from_str(json).unwrap()
+    }
+
+    fn base() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/db-drivers")
+    }
+
+    fn args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn env_value(command: &Command, key: &str) -> Option<String> {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn missing_client_is_reported_for_every_adapter() {
+        let empty = OsStr::new("/nonexistent-php-db-path");
+        for driver in Driver::ALL {
+            let error = require_client_with(driver, Some(empty))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(driver.client()), "{driver}: {error}");
+            assert!(error.contains("not found"), "{driver}: {error}");
+        }
+    }
+
+    #[test]
+    fn sqlite_integration_schema_and_query() {
+        let connection = connection(r#"{"name":"app","driver":"sqlite","path":"demo.sqlite"}"#);
+        let schema = sqlite_schema(&connection, &base()).unwrap();
+        let users = schema
+            .tables
+            .iter()
+            .find(|table| table.name == "users")
+            .expect("users table");
+        assert_eq!(
+            users
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "email", "created_at"]
+        );
+        assert!(users.columns[0].primary_key);
+        assert!(users.columns[1].not_null);
+
+        let result = sqlite_query(
+            &connection,
+            &base(),
+            "SELECT id, email FROM users ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(result.columns, vec!["id", "email"]);
+        assert_eq!(result.rows.len(), 3);
+        assert_eq!(
+            result.rows[0][1],
+            Value::String("alice@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn builds_sqlite_commands() {
+        let connection = connection(r#"{"name":"app","driver":"sqlite","path":"demo.sqlite"}"#);
+        let (command, stdin) = build_query_command(&connection, &base(), "SELECT 1").unwrap();
+        assert!(stdin.is_none());
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("sqlite3"));
+        assert_eq!(args[0], "-json");
+        assert!(args[1].ends_with("fixtures/db-drivers/demo.sqlite"));
+        assert_eq!(args[2], "SELECT 1");
+    }
+
+    #[test]
+    fn postgres_command_hides_password_and_applies_sslmode() {
+        let connection = connection(
+            r#"{"name":"pg","driver":"postgres",
+                "url":"postgres://app:s3cret@db:5432/app","sslmode":"require"}"#,
+        );
+        let (command, _) = build_query_command(&connection, Path::new("."), "SELECT 1").unwrap();
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("psql"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "postgres://app@db:5432/app?sslmode=require"));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert_eq!(env_value(&command, "PGPASSWORD").as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn mysql_command_uses_socket_and_hides_password() {
+        let connection = connection(
+            r#"{"name":"my","driver":"mysql",
+                "url":"mysql://app:s3cret@db:3306/appdb",
+                "socket":"/tmp/mysql.sock","ssl":true}"#,
+        );
+        let (command, _) = build_query_command(&connection, Path::new("."), "SELECT 1").unwrap();
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("mysql"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--socket", "/tmp/mysql.sock"]));
+        assert!(args.iter().any(|arg| arg == "--ssl-mode=REQUIRED"));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert_eq!(env_value(&command, "MYSQL_PWD").as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn mariadb_uses_legacy_ssl_flag() {
+        let connection = connection(
+            r#"{"name":"maria","driver":"mariadb","host":"h","user":"u",
+                "database":"d","ssl":true}"#,
+        );
+        let (command, _) = build_query_command(&connection, Path::new("."), "SELECT 1").unwrap();
+        let args = args(&command);
+        assert!(args.iter().any(|arg| arg == "--ssl"));
+        assert!(!args.iter().any(|arg| arg.starts_with("--ssl-mode")));
+    }
+
+    #[test]
+    fn sqlserver_command_hides_password() {
+        let connection = connection(
+            r#"{"name":"ms","driver":"sqlserver",
+                "url":"sqlserver://u:s3cret@h:1433/d"}"#,
+        );
+        let (command, _) = build_query_command(&connection, Path::new("."), "SELECT 1").unwrap();
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("sqlcmd"));
+        assert!(args.windows(2).any(|pair| pair == ["-S", "h,1433"]));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert_eq!(
+            env_value(&command, "SQLCMDPASSWORD").as_deref(),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn oracle_password_goes_to_stdin_not_argv() {
+        let connection =
+            connection(r#"{"name":"ora","driver":"oracle","url":"u:s3cret@h:1521/svc"}"#);
+        let (command, stdin) =
+            build_query_command(&connection, Path::new("."), "SELECT 1 FROM dual").unwrap();
+        let args = args(&command);
+        let script = stdin.unwrap();
+        assert_eq!(command.get_program(), OsStr::new("sqlplus"));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert!(script.contains("u/\"s3cret\"@//h:1521/svc"));
+        assert!(script.contains("SELECT 1 FROM dual;"));
+    }
+
+    #[test]
+    fn mongodb_command_hides_password() {
+        let connection = connection(
+            r#"{"name":"mongo","driver":"mongodb",
+                "url":"mongodb://u:s3cret@localhost:27017/db"}"#,
+        );
+        let (command, _) = build_exec_command(&connection, "db.stats()").unwrap();
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("mongosh"));
+        assert!(args.iter().any(|arg| arg == "mongodb://localhost:27017/db"));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert_eq!(
+            env_value(&command, "PHP_DB_MONGO_PASSWORD").as_deref(),
+            Some("s3cret")
+        );
+        assert_eq!(
+            env_value(&command, "PHP_DB_MONGO_USER").as_deref(),
+            Some("u")
+        );
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("process.env.PHP_DB_MONGO_USER")));
+    }
+
+    #[test]
+    fn redis_command_hides_password_and_keeps_db() {
+        let connection = connection(
+            r#"{"name":"cache","driver":"redis",
+                "url":"redis://:s3cret@127.0.0.1:6379/2"}"#,
+        );
+        let (command, _) = build_schema_command(&connection, Path::new(".")).unwrap();
+        let args = args(&command);
+        assert_eq!(command.get_program(), OsStr::new("redis-cli"));
+        assert!(args.windows(2).any(|pair| pair == ["-p", "6379"]));
+        assert!(args.windows(2).any(|pair| pair == ["-n", "2"]));
+        assert!(args.iter().any(|arg| arg == "--scan"));
+        assert!(!args.join(" ").contains("s3cret"));
+        assert_eq!(
+            env_value(&command, "REDISCLI_AUTH").as_deref(),
+            Some("s3cret")
+        );
+    }
+
+    #[test]
+    fn redis_exec_uses_quoted_arguments() {
+        let connection =
+            connection(r#"{"name":"cache","driver":"redis","host":"127.0.0.1","port":6379}"#);
+        let (command, _) = build_exec_command(&connection, "SET greeting \"hello world\"").unwrap();
+        let args = args(&command);
+        assert!(args.windows(2).any(|pair| pair == ["SET", "greeting"]));
+        assert!(args.iter().any(|arg| arg == "hello world"));
+    }
 
     #[test]
     fn parses_plain_csv() {
@@ -701,13 +1584,26 @@ mod tests {
     }
 
     #[test]
+    fn schema_from_lines_skips_noise() {
+        let schema = schema_from_lines("users\norders\n\n(2 rows affected)\n");
+        assert_eq!(
+            schema
+                .tables
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["users", "orders"]
+        );
+    }
+
+    #[test]
     fn parses_mysql_urls() {
         let target = parse_mysql_url("mysql://app:p%40ss@db.example:3307/appdb").unwrap();
         assert_eq!(target.host, "db.example");
         assert_eq!(target.port, Some(3307));
         assert_eq!(target.user.as_deref(), Some("app"));
         assert_eq!(target.password.as_deref(), Some("p@ss"));
-        assert_eq!(target.database, "appdb");
+        assert_eq!(target.database.as_deref(), Some("appdb"));
 
         let target = parse_mysql_url("mysql://root@localhost/appdb").unwrap();
         assert_eq!(target.host, "localhost");
@@ -717,10 +1613,20 @@ mod tests {
         let target = parse_mysql_url("mysql://u:p@[::1]:3306/appdb?ssl=true").unwrap();
         assert_eq!(target.host, "::1");
         assert_eq!(target.port, Some(3306));
-        assert_eq!(target.database, "appdb");
+        assert_eq!(target.database.as_deref(), Some("appdb"));
 
         assert!(parse_mysql_url("postgres://x/y").is_err());
         assert!(parse_mysql_url("mysql://localhost:3306").is_err());
         assert!(parse_mysql_url("mysql://localhost/").is_err());
+    }
+
+    #[test]
+    fn splits_redis_commands() {
+        assert_eq!(
+            split_command("SET key \"hello world\""),
+            vec!["SET", "key", "hello world"]
+        );
+        assert_eq!(split_command("HGETALL 'user:1'"), vec!["HGETALL", "user:1"]);
+        assert_eq!(split_command("  "), Vec::<String>::new());
     }
 }

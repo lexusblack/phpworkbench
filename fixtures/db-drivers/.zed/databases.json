@@ -1,0 +1,12 @@
+{
+  "connections": [
+    {"name":"app","driver":"sqlite","path":"demo.sqlite"},
+    {"name":"pg","driver":"postgres","url":"postgres://user@host:5432/db","password_env":"PGPASSWORD","sslmode":"require","ssh_tunnel":{"host":"bastion.example.com","user":"deploy","port":22,"identity_file":"~/.ssh/id_ed25519"}},
+    {"name":"my","driver":"mysql","host":"h","port":3306,"user":"u","database":"d","password_env":"MYSQL_PWD","socket":"/tmp/mysql.sock","ssl":true},
+    {"name":"maria","driver":"mariadb","host":"h","user":"u","database":"d","password_env":"MYSQL_PWD"},
+    {"name":"ms","driver":"sqlserver","host":"h","port":1433,"user":"u","database":"d","password_env":"SQLCMDPASSWORD"},
+    {"name":"ora","driver":"oracle","url":"user@host:1521/service"},
+    {"name":"mongo","driver":"mongodb","url":"mongodb://localhost:27017/db"},
+    {"name":"cache","driver":"redis","host":"127.0.0.1","port":6379,"password_env":"REDISCLI_AUTH"}
+  ]
+}
