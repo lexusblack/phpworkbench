@@ -67,6 +67,20 @@ Alt+Enter (быстрые фиксы), F5 (Xdebug, нужен `xdebug.mode=debug
 cd vendor/zed && cargo run -p zed
 ```
 
+Готовый бандл `dist/PhpWorkbench.app` запускается с отдельным каталогом данных:
+
+```bash
+open -n dist/PhpWorkbench.app --args --user-data-dir ~/.phpworkbench
+# или
+./scripts/run-app.sh            # ZED_USER_DATA_DIR=... для своего пути
+```
+
+> Бандл собран в канале `stable`. Если рядом уже запущен другой Zed stable
+> (даже из `target/debug`), сработает single-instance lock на порту 44438 и
+> новый процесс завершится с `zed is already running`. Для параллельного
+> запуска задайте канал: `ZED_RELEASE_CHANNEL=dev open -n ...` (переменная
+> наследуется через `open`).
+
 ## Статус
 
 - Фаза 0 (конфиг) — готова. Zed уже содержит `base_keymap: JetBrains`, он включён в
@@ -89,6 +103,8 @@ cd vendor/zed && cargo run -p zed
   через CLI. HTTP: `php-http` — `.http`-файлы, переменные, env, `--json`.
 - Тема `PhpStorm Dark` (Darcula-палитра) — `profile/themes/`; UX-спека —
   `design/UX.md`.
+- Search Everywhere в правой панели: фильтр по файлам, Remote, БД и HTTP,
+  Enter открывает первый файл, Esc очищает.
 - Фазы 2–6 — `docs/PLAN.md`.
 
 ## Лицензия
