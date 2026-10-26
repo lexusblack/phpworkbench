@@ -1,0 +1,8 @@
+[
+  {
+    "label": "deps: audit",
+    "command": "deps-audit --dir $ZED_WORKTREE_ROOT",
+    "tags": ["deps", "security"],
+    "reveal": "always"
+  }
+]

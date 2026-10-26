@@ -1,5 +1,17 @@
 [
   {
+    "label": "deps: audit",
+    "command": "deps-audit --dir $ZED_WORKTREE_ROOT",
+    "tags": ["deps", "security"],
+    "reveal": "always"
+  },
+  {
+    "label": "deps: audit (JSON)",
+    "command": "deps-audit --dir $ZED_WORKTREE_ROOT --json",
+    "tags": ["deps", "security"],
+    "reveal": "always"
+  },
+  {
     "label": "composer: install",
     "command": "composer install",
     "tags": ["composer"]
