@@ -16,7 +16,7 @@
 
 ## Фаза 2. Search Everywhere и навигация
 
-- [~] Единый поиск: фильтр по файлам + Remote/БД/HTTP, Enter/Esc (нет символов, действий, команд и composer-пакетов)
+- [~] Единый поиск: файлы, символы, Remote/БД/HTTP, ранжирование, Enter/Esc (нет действий, команд и composer-пакетов)
 - [ ] Ранжирование и превью
 - [ ] Eval-набор 30 запросов, top-1 ≥ 80 %
 - [ ] Call/type hierarchy
@@ -32,7 +32,7 @@
 - [~] Деплой (`php-deploy`) — local/sftp, sync/upload/watch
 - [~] Панель Remote в правом доке: список серверов + вызов sync (клик не проверен автоматически)
 - [~] Панель Databases: список подключений (нет схемы, грида и консоли)
-- [~] Панель HTTP: список .http-файлов и открытие (нет запуска и ответа)
+- [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
 - [ ] Composer-панель (add/remove/outdated)
 - [ ] Gutter-запуск PHPUnit/Pest + coverage
 - [ ] Run configurations
