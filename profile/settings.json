@@ -1,0 +1,82 @@
+{
+  "theme": "One Dark",
+  "base_keymap": "JetBrains",
+  "buffer_font_family": "JetBrains Mono",
+  "buffer_font_size": 13,
+  "ui_font_family": "Inter",
+  "ui_font_size": 12,
+  "tab_size": 4,
+  "hard_tabs": false,
+  "preferred_line_length": 120,
+  "soft_wrap": "none",
+  "autosave": "on_focus_change",
+  "format_on_save": "off",
+  "ensure_final_newline_on_save": true,
+  "remove_trailing_whitespace_on_save": true,
+  "show_whitespaces": "selection",
+  "relative_line_numbers": "enabled",
+  "inlay_hints": {
+    "enabled": true
+  },
+  "git": {
+    "inline_blame": {
+      "enabled": true,
+      "delay_ms": 500
+    }
+  },
+  "search": {
+    "case_sensitive": "smart"
+  },
+  "project_panel": {
+    "dock": "left",
+    "button": true,
+    "default_width": 280
+  },
+  "outline_panel": {
+    "dock": "left",
+    "button": true,
+    "default_width": 280
+  },
+  "git_panel": {
+    "dock": "left",
+    "button": true
+  },
+  "debugger": {
+    "dock": "bottom"
+  },
+  "terminal": {
+    "dock": "bottom"
+  },
+  "collaboration_panel": {
+    "dock": "left",
+    "button": false
+  },
+  "agent": {
+    "dock": "right",
+    "button": false
+  },
+  "languages": {
+    "PHP": {
+      "language_servers": [
+        "phpantom",
+        "!intelephense",
+        "!phpactor",
+        "!phptools"
+      ],
+      "format_on_save": "off"
+    }
+  },
+  "lsp": {
+    "phpantom": {
+      "binary": {
+        "path": "phpantom_lsp"
+      }
+    },
+    "intelephense": {
+      "initialization_options": {
+        "storagePath": "/tmp/intelephense",
+        "clearCache": false
+      }
+    }
+  }
+}

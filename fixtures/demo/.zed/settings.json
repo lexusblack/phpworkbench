@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "phpantom": {
+      "binary": {
+        "path": "/Users/admin/.cargo/bin/phpantom_lsp"
+      }
+    }
+  },
+  "languages": {
+    "PHP": {
+      "language_servers": ["phpantom"]
+    }
+  }
+}

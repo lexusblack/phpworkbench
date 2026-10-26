@@ -1,0 +1,71 @@
+[
+  {
+    "label": "composer: install",
+    "command": "composer install",
+    "tags": ["composer"]
+  },
+  {
+    "label": "composer: dump-autoload",
+    "command": "composer dump-autoload -o",
+    "tags": ["composer"]
+  },
+  {
+    "label": "composer: outdated",
+    "command": "composer outdated --direct",
+    "tags": ["composer"],
+    "reveal": "always"
+  },
+  {
+    "label": "phpunit: all",
+    "command": "vendor/bin/phpunit",
+    "tags": ["phpunit", "test"],
+    "reveal": "always"
+  },
+  {
+    "label": "phpunit: current file",
+    "command": "vendor/bin/phpunit \"$ZED_FILE\"",
+    "tags": ["phpunit", "test"],
+    "reveal": "always"
+  },
+  {
+    "label": "pest: all",
+    "command": "vendor/bin/pest",
+    "tags": ["pest", "test"],
+    "reveal": "always"
+  },
+  {
+    "label": "phpstan: analyse",
+    "command": "vendor/bin/phpstan analyse --memory-limit=2G",
+    "tags": ["lint"],
+    "reveal": "always"
+  },
+  {
+    "label": "psalm: analyse",
+    "command": "vendor/bin/psalm --no-cache",
+    "tags": ["lint"],
+    "reveal": "always"
+  },
+  {
+    "label": "php-cs-fixer: dry-run",
+    "command": "vendor/bin/php-cs-fixer fix --dry-run --diff",
+    "tags": ["lint"],
+    "reveal": "always"
+  },
+  {
+    "label": "php: syntax check",
+    "command": "php -l \"$ZED_FILE\"",
+    "reveal": "always"
+  },
+  {
+    "label": "artisan: serve",
+    "command": "php artisan serve",
+    "tags": ["serve"],
+    "reveal": "always"
+  },
+  {
+    "label": "artisan: migrate",
+    "command": "php artisan migrate",
+    "tags": ["db"],
+    "reveal": "always"
+  }
+]

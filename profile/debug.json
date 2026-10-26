@@ -1,0 +1,19 @@
+[
+  {
+    "label": "Xdebug: listen (9003)",
+    "adapter": "Xdebug",
+    "request": "attach",
+    "port": 9003,
+    "pathMappings": {
+      "/var/www/html": "$ZED_WORKTREE_ROOT"
+    }
+  },
+  {
+    "label": "Xdebug: launch script",
+    "adapter": "Xdebug",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/index.php",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "port": 9003
+  }
+]
