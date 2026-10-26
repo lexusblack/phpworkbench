@@ -12,6 +12,30 @@
     "reveal": "always"
   },
   {
+    "label": "deploy: check",
+    "command": "php-deploy check",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
+    "label": "deploy: sync",
+    "command": "php-deploy sync",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
+    "label": "deploy: watch",
+    "command": "php-deploy watch --interval 2",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
+    "label": "deploy: upload current file",
+    "command": "php-deploy upload --file \"$ZED_FILE\"",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
     "label": "composer: install",
     "command": "composer install",
     "tags": ["composer"]

@@ -85,6 +85,10 @@ call/type hierarchy и «перейти к тесту» работают.
 
 ## Фаза 5 — remote, deploy, profiler (месяцы 9–15)
 
+Статус: движок деплоя готов (`tools/php-deploy`: local/sftp, sync/upload/watch,
+dry-run, исключения). Нет UI: панелей Remote/DB, окна настроек и интеграции с
+событием сохранения. См. `docs/DEPLOY.md`.
+
 SFTP/FTP-синхронизация, Docker/WSL-интерпретаторы, SSH-терминал,
 Xdebug-профайлер со снапшотами.
 

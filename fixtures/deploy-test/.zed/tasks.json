@@ -1,0 +1,20 @@
+[
+  {
+    "label": "deploy: check",
+    "command": "php-deploy check",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
+    "label": "deploy: sync",
+    "command": "php-deploy sync",
+    "tags": ["deploy"],
+    "reveal": "always"
+  },
+  {
+    "label": "deploy: watch",
+    "command": "php-deploy watch --interval 1",
+    "tags": ["deploy"],
+    "reveal": "always"
+  }
+]

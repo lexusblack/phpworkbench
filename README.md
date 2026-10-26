@@ -79,6 +79,8 @@ cd vendor/zed && cargo run -p zed
   (2 теста проходят).
 - Аудит зависимостей: `deps-audit` (OSV + Packagist/npm) и LSP-расширение
   `deps-guard` — уязвимые пакеты подчёркиваются в `composer.json`/`package.json`.
+- Деплой: `php-deploy` — SFTP/local, `sync`, `upload`, `watch`
+  (авто-загрузка изменённых файлов). Подробности — `docs/DEPLOY.md`.
 - Фазы 2–6 — `docs/PLAN.md`.
 
 ## Лицензия

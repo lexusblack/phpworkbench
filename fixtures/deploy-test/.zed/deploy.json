@@ -1,0 +1,36 @@
+{
+  "default": "local",
+  "servers": [
+    {
+      "name": "local",
+      "protocol": "local",
+      "local_root": ".",
+      "remote_root": "/tmp/php-deploy-target",
+      "exclude": [
+        "vendor/",
+        "node_modules/",
+        ".git/",
+        ".zed/",
+        "*.log"
+      ],
+      "upload_on_save": true
+    },
+    {
+      "name": "staging",
+      "protocol": "sftp",
+      "host": "127.0.0.1",
+      "port": 2222,
+      "user": "deploy",
+      "local_root": ".",
+      "remote_root": "/var/www/app",
+      "exclude": [
+        "vendor/",
+        "node_modules/",
+        ".git/",
+        ".zed/",
+        "*.log"
+      ],
+      "upload_on_save": true
+    }
+  ]
+}

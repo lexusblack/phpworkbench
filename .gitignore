@@ -6,3 +6,7 @@ target/
 .build/
 extensions/deps-guard/target/
 extensions/deps-guard/extension.wasm
+node_modules/
+fixtures/frameworks/node_modules/
+!fixtures/deploy-test/vendor/
+!fixtures/deploy-test/vendor/ignored.php
