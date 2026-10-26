@@ -1,0 +1,13 @@
+{
+  "default": "local",
+  "servers": [
+    {
+      "name": "local",
+      "protocol": "local",
+      "local_root": ".",
+      "remote_root": "/tmp/workbench-target",
+      "exclude": ["vendor/", ".git/", ".zed/", "*.log"],
+      "upload_on_save": true
+    }
+  ]
+}

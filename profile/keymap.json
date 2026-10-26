@@ -3,7 +3,8 @@
     "context": "Workspace",
     "bindings": {
       "cmd-shift-t": "workspace::NewTerminal",
-      "ctrl-shift-`": "terminal_panel::ToggleFocus"
+      "ctrl-shift-`": "terminal_panel::ToggleFocus",
+      "cmd-alt-p": "php_panel::ToggleFocus"
     }
   }
 ]

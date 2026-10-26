@@ -1,0 +1,34 @@
+name: tools
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+          tools: composer
+
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Build the CLI tools
+        run: |
+          cargo install --path tools/deps-audit
+          cargo install --path tools/php-db
+          cargo install --path tools/php-http
+          cargo install --path tools/php-deploy
+
+      - name: Install PHPUnit fixture dependencies
+        run: composer install --working-dir=fixtures/demo --no-interaction --prefer-dist
+
+      - name: Acceptance (offline)
+        run: scripts/acceptance.sh --offline

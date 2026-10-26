@@ -1,0 +1,13 @@
+@host = http://127.0.0.1:8765
+
+### list
+GET {{host}}/items
+
+### create
+POST {{host}}/items
+Content-Type: application/json
+
+{"name":"demo"}
+
+### missing
+GET {{host}}/missing

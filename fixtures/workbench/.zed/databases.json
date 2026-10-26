@@ -1,0 +1,5 @@
+{
+  "connections": [
+    { "name": "app", "driver": "sqlite", "path": "demo.sqlite" }
+  ]
+}
