@@ -109,5 +109,31 @@ export PATH="/opt/homebrew/bin:$PATH"
 cd vendor/zed && ./target/debug/zed --user-data-dir /tmp/zed-test ../../fixtures/demo
 ```
 
-**Не проверено:** hover/completion через клавиатуру, Composer и Xdebug.
+**Не проверено:** hover/completion через клавиатуру.
 Кнопка `php_panel` подтверждена: tooltip «PHP».
+
+## Панель v1 — 2026-10-26 19:12
+
+`crates/php_panel` теперь функциональна, а не заглушка:
+
+- `Project::visible_worktrees` → `Snapshot::files` → фильтр `.php`;
+- `uniform_list` + `ListItem` + `on_click` → `Workspace::open_path`;
+- подписка на `ProjectEvent` (добавление/удаление worktree, изменения файлов);
+- `starts_open = true` — панель открывается сразу.
+
+Проверено скриншотом: «PHP · 3 files», строки `index.php`,
+`src/Greeter.php`, `src/GreetingService.php`.
+
+**Ограничение:** клик не удалось воспроизвести автоматически. Dev-бинарник
+вне `.app` не становится активным окном, а вручную собранный бандл падает —
+debug-сборка Zed грузит ассеты из исходников (`rust-embed` →
+`util::asset_str`). Для клика и упаковки нужен release-билд
+(`script/bundle-mac`).
+
+## Composer, Xdebug, PHPUnit
+
+- PHP 8.5.12, Composer 2.10.3, Xdebug 3.5.3.
+- `xdebug.mode=debug`, `xdebug.start_with_request=trigger`
+  (`/opt/homebrew/etc/php/8.5/conf.d/ext-xdebug.ini`) — без шума в CLI.
+- Фикстура: PHPUnit 13.4.3, `vendor/bin/phpunit tests` → 2 tests,
+  2 assertions, OK.

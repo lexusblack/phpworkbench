@@ -73,8 +73,10 @@ cd vendor/zed && cargo run -p zed
 - PHP-интеллект проверен вживую: Zed сам поднимает `phpantom_lsp`, статус-бар
   показывает `PHP`, outline и breadcrumbs приходят от LSP. Установка
   расширения — `scripts/install-php-extension.sh`.
-- Собственная панель `php_panel` видна в доке (tooltip «PHP») — значит форк
-  расширяем панелями без расширения Zed API.
+- Собственная панель `php_panel` видна в доке (tooltip «PHP») и показывает
+  список PHP-файлов проекта с открытием по клику.
+- PHP-тулчейн: PHP 8.5.12, Composer 2.10.3, Xdebug 3.5.3, PHPUnit 13.4.3
+  (2 теста проходят).
 - Фазы 2–6 — `docs/PLAN.md`.
 
 ## Лицензия
