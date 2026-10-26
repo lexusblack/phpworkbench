@@ -19,6 +19,11 @@
 Ключевое: Zed из коробки содержит только bash/c/cpp/css/diff/env/go/json/markdown/
 python/rust/typescript/tsx/yaml. PHP, Blade и Vue — всегда расширения.
 
+Проверено вживую: `fixtures/frameworks/App.tsx` — статус-бар `TSX`, JSX
+подсвечен, Zed запустил `vtsls`. Девять диагностик в фикстуре ожидаемы: рядом
+нет `node_modules` с типами React. Для чистого результата нужен
+`package.json` + `npm install`.
+
 ## Установка (когда появится UI/реестр)
 
 1. `php` — уже установлено вручную (см. `scripts/install-php-extension.sh`).
