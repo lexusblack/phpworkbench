@@ -34,7 +34,7 @@
 - [x] Панель Databases: подключения, схема, грид данных и SQL-консоль (чтение)
 - [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
 - [~] Composer: движок php-composer (list/outdated/validate/scripts/require/remove); UI-панели нет
-- [~] Движок php-test (PHPUnit/Pest через JUnit); gutter-запуск и coverage не сделаны
+- [~] Тесты: панель Tests (run all/файл, статусы) + coverage в php-test; gutter-запуск не сделан
 - [ ] Run configurations
 
 ## Фаза 4. Рефакторинги и инспекции
