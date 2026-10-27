@@ -9,7 +9,7 @@ result into stable JSON.
 ```text
 php-test list [--dir PATH] [--json]
 php-test run  [--dir PATH] [--filter PATTERN] [--file REL]
-              [--group NAME] [--json] [--no-coverage]
+              [--group NAME] [--coverage] [--json] [--no-coverage]
 ```
 
 - `--dir` defaults to `.`; the runner walks up from it to find a Composer
@@ -20,6 +20,10 @@ php-test run  [--dir PATH] [--filter PATTERN] [--file REL]
 - `run` invokes the discovered binary with `--log-junit <temp>`. `--filter`,
   `--group`, and `--no-coverage` are forwarded; `--file` is passed as the
   positional test path.
+- `--coverage` adds `--coverage-clover <temp>` and runs PHP with
+  `XDEBUG_MODE=coverage`. When the nearest `phpunit.xml` has no `<source>`
+  element and `src/` exists, `--coverage-filter src` is added so PHPUnit 10+
+  emits a report. `--coverage` and `--no-coverage` are mutually exclusive.
 
 Examples:
 
@@ -30,6 +34,8 @@ php-test run --dir fixtures/test-runner
 php-test run --dir fixtures/test-runner --file tests/CalculatorTest.php
 php-test run --dir fixtures/test-runner --filter Failing
 php-test run --dir fixtures/test-runner --json
+php-test run --dir fixtures/test-runner --coverage
+php-test run --dir fixtures/test-runner --file tests/CalculatorTest.php --coverage --json
 ```
 
 ## JSON output
@@ -56,6 +62,14 @@ php-test run --dir fixtures/test-runner --json
     "errors": 0,
     "skipped": 0,
     "time": 0.00037
+  },
+  "coverage": {
+    "lines_total": 6,
+    "lines_covered": 6,
+    "percent": 100.0,
+    "files": [
+      {"file": "src/Calculator.php", "total": 6, "covered": 6, "percent": 100.0}
+    ]
   }
 }
 ```
@@ -66,6 +80,10 @@ php-test run --dir fixtures/test-runner --json
 - `file` is relative to `--dir` when the JUnit path is inside the project,
   otherwise the absolute path reported by the runner.
 - `summary.time` is the sum of testcase times.
+- `coverage` is present on every `run --json` call: `null` when coverage was
+  not requested or could not be collected, otherwise totals plus one entry per
+  file. `lines_total`/`lines_covered` count Clover `stmt` and `method` lines;
+  `percent` is `0.0` when a file has no executable lines.
 
 `list --json` emits:
 
@@ -80,6 +98,14 @@ PASS App\Tests\CalculatorTest::testAddsNumbers (0.000s)
 FAIL App\Tests\FailingTest::testFailsOnPurpose - Failed asserting that 5 is identical to 4.
 SKIP App\Tests\FailingTest::testIsSkipped (0.000s)
 Tests: 5 | Passed: 3 | Failed: 1 | Errors: 0 | Skipped: 1 | Time: 0.004s
+```
+
+With `--coverage`, a coverage block follows the summary:
+
+```text
+Coverage:
+src/Calculator.php: 100.00% (6/6)
+Total: 100.00% (6/6)
 ```
 
 ## Exit codes
@@ -100,8 +126,15 @@ line and the stack-trace paragraph are stripped.
 ## Limitations
 
 - One PHPUnit/Pest process per run; no parallel execution or sharding.
-- No coverage collection or coverage UI. `--no-coverage` only forwards the
-  runner flag; coverage is never enabled or displayed.
+- Coverage is file-level only: no per-class, branch, path, or condition
+  coverage. Clover `cond` lines are ignored.
+- Coverage needs Xdebug or PCOV. If the coverage run fails or produces no
+  Clover report, `php-test` prints a warning and still reports the test
+  results; when the coverage run produces no JUnit at all (for example no
+  driver is loaded) it retries once without coverage and preserves the exit
+  code.
+- The `src/` coverage-filter fallback is a convenience. Projects whose source
+  lives elsewhere should declare `<source><include>` in `phpunit.xml`.
 - Pest projects with both binaries always use Pest; there is no tool override.
 - PHP must be available on `PATH` because Composer's bin proxies use
   `#!/usr/bin/env php`.

@@ -14,3 +14,4 @@ dist/
 extensions/php-lint/target/
 extensions/php-lint/extension.wasm
 backups/
+.phpunit.cache/

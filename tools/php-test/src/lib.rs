@@ -12,7 +12,7 @@ php-test - PHPUnit/Pest test runner bridge
 Usage:
   php-test list [--dir PATH] [--json]
   php-test run  [--dir PATH] [--filter PATTERN] [--file REL]
-                [--group NAME] [--json] [--no-coverage]
+                [--group NAME] [--coverage] [--json] [--no-coverage]
 
 Commands:
   list   List test files discovered under tests/ and phpunit.xml testsuites
@@ -23,6 +23,7 @@ Options:
   --filter PATTERN Only run tests whose name matches PATTERN
   --file REL       Run a single test file, relative to --dir
   --group NAME     Only run tests in the given group
+  --coverage       Collect line coverage with a Clover report
   --json           Emit normalized JSON
   --no-coverage    Disable coverage collection
   -h, --help       Show this help
@@ -74,6 +75,7 @@ pub struct RunOptions {
     pub file: Option<String>,
     pub group: Option<String>,
     pub json: bool,
+    pub coverage: bool,
     pub no_coverage: bool,
 }
 
@@ -85,6 +87,7 @@ impl Default for RunOptions {
             file: None,
             group: None,
             json: false,
+            coverage: false,
             no_coverage: false,
         }
     }
@@ -119,6 +122,7 @@ where
     let mut filter = None;
     let mut file = None;
     let mut group = None;
+    let mut coverage = false;
     let mut no_coverage = false;
 
     while let Some(arg) = args.next() {
@@ -129,6 +133,7 @@ where
             "--filter" if is_run => filter = Some(next_value(&mut args, "--filter")?),
             "--file" if is_run => file = Some(next_value(&mut args, "--file")?),
             "--group" if is_run => group = Some(next_value(&mut args, "--group")?),
+            "--coverage" if is_run => coverage = true,
             "--no-coverage" if is_run => no_coverage = true,
             other => bail!("unknown option '{other}' for {command}\n\n{USAGE}"),
         }
@@ -141,6 +146,7 @@ where
             file,
             group,
             json,
+            coverage,
             no_coverage,
         }))
     } else {
@@ -364,10 +370,27 @@ pub struct Summary {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FileCoverage {
+    pub file: String,
+    pub total: usize,
+    pub covered: usize,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Coverage {
+    pub lines_total: usize,
+    pub lines_covered: usize,
+    pub percent: f64,
+    pub files: Vec<FileCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Report {
     pub tool: String,
     pub tests: Vec<TestResult>,
     pub summary: Summary,
+    pub coverage: Option<Coverage>,
 }
 
 pub fn parse_junit(xml: &str, project_dir: &Path, tool: Tool) -> Result<Report> {
@@ -397,7 +420,97 @@ pub fn parse_junit(xml: &str, project_dir: &Path, tool: Tool) -> Result<Report> 
         tool: tool.as_str().to_string(),
         tests,
         summary,
+        coverage: None,
     })
+}
+
+/// Parse a PHPUnit/Pest Clover report into per-file line coverage.
+pub fn parse_clover(xml: &str, project_dir: &Path) -> Result<Coverage> {
+    let root = parse_xml(xml).context("failed to parse Clover XML")?;
+    let project = find_named(&root, "project").context("Clover XML has no <project> element")?;
+    let base = fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+    let mut files = Vec::new();
+    collect_clover_files(project, &base, &mut files);
+    files.sort_by(|left, right| left.file.cmp(&right.file));
+
+    if files.is_empty() {
+        if let Some(metrics) = find_named(project, "metrics") {
+            let total = metric_value(metrics, "statements");
+            let covered = metric_value(metrics, "coveredstatements");
+            return Ok(Coverage {
+                lines_total: total,
+                lines_covered: covered,
+                percent: percent(covered, total),
+                files,
+            });
+        }
+    }
+
+    let lines_total = files.iter().map(|file| file.total).sum();
+    let lines_covered = files.iter().map(|file| file.covered).sum();
+    Ok(Coverage {
+        lines_total,
+        lines_covered,
+        percent: percent(lines_covered, lines_total),
+        files,
+    })
+}
+
+fn collect_clover_files(node: &XmlNode, base: &Path, out: &mut Vec<FileCoverage>) {
+    for child in &node.children {
+        if child.name == "file" {
+            out.push(clover_file(child, base));
+        } else {
+            collect_clover_files(child, base, out);
+        }
+    }
+}
+
+fn clover_file(node: &XmlNode, base: &Path) -> FileCoverage {
+    let mut total = 0;
+    let mut covered = 0;
+    for line in &node.children {
+        if line.name != "line" {
+            continue;
+        }
+        let kind = line.attr("type").unwrap_or("stmt");
+        if kind != "stmt" && kind != "method" {
+            continue;
+        }
+        total += 1;
+        if line
+            .attr("count")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0
+        {
+            covered += 1;
+        }
+    }
+    let file = node
+        .attr("name")
+        .map(|name| display_relative(base, Path::new(name)))
+        .unwrap_or_default();
+    FileCoverage {
+        file,
+        total,
+        covered,
+        percent: percent(covered, total),
+    }
+}
+
+fn metric_value(node: &XmlNode, key: &str) -> usize {
+    node.attr(key)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
+fn percent(covered: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        covered as f64 / total as f64 * 100.0
+    }
 }
 
 fn collect_cases(node: &XmlNode, suite: &str, file: &str, base: &Path, out: &mut Vec<TestResult>) {
@@ -503,11 +616,19 @@ pub fn has_failures(report: &Report) -> bool {
         .any(|test| matches!(test.status, Status::Fail | Status::Error))
 }
 
-pub fn tool_args(options: &RunOptions, junit: &Path) -> Vec<String> {
+pub fn tool_args(options: &RunOptions, junit: &Path, clover: Option<&Path>) -> Vec<String> {
     let mut args = vec![
         "--log-junit".to_string(),
         junit.to_string_lossy().into_owned(),
     ];
+    if let Some(clover) = clover {
+        args.push("--coverage-clover".to_string());
+        args.push(clover.to_string_lossy().into_owned());
+        if let Some(filter) = coverage_filter(&options.dir) {
+            args.push("--coverage-filter".to_string());
+            args.push(filter.to_string());
+        }
+    }
     if let Some(filter) = &options.filter {
         args.push("--filter".to_string());
         args.push(filter.clone());
@@ -523,6 +644,20 @@ pub fn tool_args(options: &RunOptions, junit: &Path) -> Vec<String> {
         args.push(file.clone());
     }
     args
+}
+
+/// PHPUnit 10+ needs a configured source filter before it will emit coverage.
+/// When `phpunit.xml` has no `<source>` element, fall back to `src/`.
+fn coverage_filter(dir: &Path) -> Option<&'static str> {
+    let base = fs::canonicalize(dir).ok()?;
+    if let Some((_, text)) = find_phpunit_config(&base) {
+        if let Ok(root) = parse_xml(&text) {
+            if find_named(&root, "source").is_some() {
+                return None;
+            }
+        }
+    }
+    base.join("src").is_dir().then_some("src")
 }
 
 pub fn render_run(report: &Report) -> String {
@@ -556,6 +691,22 @@ pub fn render_run(report: &Report) -> String {
         report.summary.skipped,
         report.summary.time
     );
+    if let Some(coverage) = &report.coverage {
+        let _ = writeln!(output);
+        let _ = writeln!(output, "Coverage:");
+        for file in &coverage.files {
+            let _ = writeln!(
+                output,
+                "{}: {:.2}% ({}/{})",
+                file.file, file.percent, file.covered, file.total
+            );
+        }
+        let _ = writeln!(
+            output,
+            "Total: {:.2}% ({}/{})",
+            coverage.percent, coverage.lines_covered, coverage.lines_total
+        );
+    }
     output
 }
 
@@ -833,6 +984,7 @@ mod tests {
                 file: Some("tests/FailingTest.php".to_string()),
                 group: Some("slow".to_string()),
                 json: true,
+                coverage: false,
                 no_coverage: true,
             })
         );
@@ -965,10 +1117,11 @@ RuntimeException: boom
             file: Some("tests/FailingTest.php".to_string()),
             group: Some("slow".to_string()),
             json: true,
+            coverage: false,
             no_coverage: true,
         };
         assert_eq!(
-            tool_args(&options, Path::new("/tmp/junit.xml")),
+            tool_args(&options, Path::new("/tmp/junit.xml"), None),
             vec![
                 "--log-junit",
                 "/tmp/junit.xml",
@@ -980,5 +1133,145 @@ RuntimeException: boom
                 "tests/FailingTest.php",
             ]
         );
+    }
+
+    fn clover_sample(base: &Path) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<coverage generated="1">
+  <project timestamp="1" name="Clover Coverage">
+    <package name="App">
+      <file name="{base}/src/Calculator.php">
+        <class name="App\Calculator"/>
+        <line num="9" type="method" name="add" count="1"/>
+        <line num="11" type="stmt" count="1"/>
+        <line num="14" type="method" name="subtract" count="0"/>
+        <line num="16" type="stmt" count="0"/>
+      </file>
+      <file name="{base}/src/Helper.php">
+        <line num="5" type="stmt" count="1"/>
+        <line num="6" type="stmt" count="1"/>
+      </file>
+    </package>
+    <metrics statements="4" coveredstatements="2"/>
+  </project>
+</coverage>"#,
+            base = base.display()
+        )
+    }
+
+    #[test]
+    fn parses_clover_statements_methods_and_percentages() {
+        let dir = temp_dir("clover");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/Calculator.php"), "<?php").unwrap();
+        fs::write(dir.join("src/Helper.php"), "<?php").unwrap();
+        let base = fs::canonicalize(&dir).unwrap();
+
+        let coverage = parse_clover(&clover_sample(&base), &dir).unwrap();
+        assert_eq!(coverage.files.len(), 2);
+        assert_eq!(coverage.files[0].file, "src/Calculator.php");
+        assert_eq!(coverage.files[0].total, 4);
+        assert_eq!(coverage.files[0].covered, 2);
+        assert!((coverage.files[0].percent - 50.0).abs() < 1e-9);
+        assert_eq!(coverage.files[1].file, "src/Helper.php");
+        assert_eq!(coverage.files[1].total, 2);
+        assert_eq!(coverage.files[1].covered, 2);
+        assert!((coverage.files[1].percent - 100.0).abs() < 1e-9);
+        assert_eq!(coverage.lines_total, 6);
+        assert_eq!(coverage.lines_covered, 4);
+        assert!((coverage.percent - 200.0 / 3.0).abs() < 1e-9);
+
+        let json = serde_json::to_value(&coverage).unwrap();
+        assert_eq!(json["lines_total"], 6);
+        assert_eq!(json["lines_covered"], 4);
+        assert_eq!(json["files"][0]["file"], "src/Calculator.php");
+        assert_eq!(json["files"][0]["total"], 4);
+        assert_eq!(json["files"][0]["covered"], 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handles_empty_and_missing_clover_coverage() {
+        let dir = temp_dir("clover-empty");
+
+        let empty = parse_clover("<coverage><project/></coverage>", &dir).unwrap();
+        assert_eq!(empty.lines_total, 0);
+        assert_eq!(empty.lines_covered, 0);
+        assert_eq!(empty.percent, 0.0);
+        assert!(empty.files.is_empty());
+
+        let metrics = parse_clover(
+            r#"<coverage><project><metrics statements="10" coveredstatements="5"/></project></coverage>"#,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(metrics.lines_total, 10);
+        assert_eq!(metrics.lines_covered, 5);
+        assert!((metrics.percent - 50.0).abs() < 1e-9);
+
+        assert!(parse_clover("", &dir).is_err());
+        assert!(parse_clover("<coverage/>", &dir).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn computes_percent_without_division_by_zero() {
+        assert_eq!(percent(0, 0), 0.0);
+        assert_eq!(percent(5, 5), 100.0);
+        assert!((percent(1, 3) - 33.333_333).abs() < 1e-5);
+    }
+
+    #[test]
+    fn builds_coverage_arguments_with_source_fallback() {
+        let dir = temp_dir("coverage-args");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let options = RunOptions {
+            dir: dir.clone(),
+            coverage: true,
+            ..RunOptions::default()
+        };
+        let args = tool_args(
+            &options,
+            Path::new("/tmp/junit.xml"),
+            Some(Path::new("/tmp/clover.xml")),
+        );
+        assert!(args.contains(&"--coverage-clover".to_string()));
+        assert!(args.contains(&"/tmp/clover.xml".to_string()));
+        assert!(args.contains(&"--coverage-filter".to_string()));
+        assert!(args.contains(&"src".to_string()));
+        assert!(!args.contains(&"--no-coverage".to_string()));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn renders_coverage_after_test_summary() {
+        let report = Report {
+            tool: "phpunit".to_string(),
+            tests: Vec::new(),
+            summary: Summary {
+                total: 0,
+                passed: 0,
+                failed: 0,
+                errors: 0,
+                skipped: 0,
+                time: 0.0,
+            },
+            coverage: Some(Coverage {
+                lines_total: 4,
+                lines_covered: 3,
+                percent: 75.0,
+                files: vec![FileCoverage {
+                    file: "src/Calculator.php".to_string(),
+                    total: 4,
+                    covered: 3,
+                    percent: 75.0,
+                }],
+            }),
+        };
+        let text = render_run(&report);
+        assert!(text.contains("Coverage:"));
+        assert!(text.contains("src/Calculator.php: 75.00% (3/4)"));
+        assert!(text.contains("Total: 75.00% (3/4)"));
     }
 }
