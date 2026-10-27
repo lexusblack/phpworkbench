@@ -4,8 +4,8 @@
     {
       "name": "local",
       "protocol": "local",
-      "local_root": ".",
       "remote_root": "remote",
+      "local_root": ".",
       "exclude": []
     },
     {
@@ -16,6 +16,15 @@
       "user": "deploy",
       "remote_root": "/var/www/app",
       "local_root": ".",
+      "exclude": []
+    },
+    {
+      "name": "web1",
+      "protocol": "sftp",
+      "host": "127.0.0.1",
+      "port": 2222,
+      "user": "deploy",
+      "remote_root": "webroot",
       "exclude": []
     }
   ],

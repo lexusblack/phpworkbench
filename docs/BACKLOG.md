@@ -29,8 +29,8 @@
 - [~] Движок БД (`php-db`) — SQLite, schema/query/JSON, guard
 - [~] Движок HTTP (`php-http`) — `.http`, переменные, env, JSON
 - [~] Аудит зависимостей (`deps-audit`) + LSP-подсветка
-- [~] Деплой (`php-deploy`) — local/sftp, sync/upload/watch
-- [~] Панель Remote в правом доке: список серверов + вызов sync (клик не проверен автоматически)
+- [x] Деплой: Tools-меню (Deployment Configuration.../Browse Remote Host), диалог отдельным окном (список+/-. tabs Connection/Mappings/Excluded, Test Connection, OK/Cancel), дропдаун сервера в панели, сервер в статус-баре окна (<no default server>), персист active — e2e проверено
+- [x] Панель Remote: picker+дропдаун, root-строка, дерево, Refresh/Sync — e2e проверено
 - [x] Панель Databases: подключения, схема, грид данных и SQL-консоль (чтение)
 - [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
 - [~] Composer: движок php-composer (list/outdated/validate/scripts/require/remove); UI-панели нет
