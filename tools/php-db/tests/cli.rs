@@ -95,6 +95,27 @@ fn sqlite_end_to_end() {
 }
 
 #[test]
+fn databases_and_views_end_to_end_sqlite() {
+    let output = run(&["databases", "app", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["connection"], "app");
+    assert_eq!(value["driver"], "sqlite");
+    assert_eq!(value["databases"], serde_json::json!(["demo.sqlite"]));
+
+    let output = run(&["views", "app", "--json"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["driver"], "sqlite");
+    // The fixture has no views; the shape is still the schema row shape.
+    assert_eq!(value["views"], serde_json::json!([]));
+
+    let output = run(&["views", "app"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("(no views)"));
+}
+
+#[test]
 fn destructive_query_needs_allow_write() {
     let output = run(&["query", "app", "delete from users"]);
     assert_eq!(output.status.code(), Some(2));

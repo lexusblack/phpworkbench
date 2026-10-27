@@ -15,6 +15,8 @@ php-db - database engine for a PhpStorm-like IDE
 Usage:
   php-db [--config PATH] list [--json]
   php-db [--config PATH] check <connection> [--json]
+  php-db [--config PATH] databases <connection> [--json]
+  php-db [--config PATH] views <connection> [--json]
   php-db [--config PATH] schema <connection> [--json]
   php-db [--config PATH] query <connection> \"<sql>\" [--json] [--allow-write]
   php-db [--config PATH] exec <connection> \"<command>\" [--allow-write]
@@ -103,6 +105,20 @@ fn run() -> Result<()> {
             };
             let store = Store::load(cli.config.as_deref())?;
             cmd_schema(&store, name, cli.json)
+        }
+        "databases" => {
+            let [name] = args else {
+                bail!("usage: php-db databases <connection> [--json]");
+            };
+            let store = Store::load(cli.config.as_deref())?;
+            cmd_databases(&store, name, cli.json)
+        }
+        "views" => {
+            let [name] = args else {
+                bail!("usage: php-db views <connection> [--json]");
+            };
+            let store = Store::load(cli.config.as_deref())?;
+            cmd_views(&store, name, cli.json)
         }
         "query" => {
             let [name, sql] = args else {
@@ -356,6 +372,86 @@ fn cmd_schema(store: &Store, name: &str, json_output: bool) -> Result<()> {
                 format!("  [{}]", flags.join(", "))
             };
             println!("    {:width$}  {kind}{suffix}", column.name, width = width);
+        }
+    }
+    Ok(())
+}
+
+fn cmd_databases(store: &Store, name: &str, json_output: bool) -> Result<()> {
+    let connection = store.get(name)?;
+    let names = db::databases(connection, &store.base)?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "connection": connection.name,
+                "driver": connection.driver,
+                "databases": names,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{} ({})", connection.name, connection.driver);
+    for name in &names {
+        println!("  {name}");
+    }
+    Ok(())
+}
+
+fn cmd_views(store: &Store, name: &str, json_output: bool) -> Result<()> {
+    let connection = store.get(name)?;
+    let schema = db::views(connection, &store.base)?;
+
+    if json_output {
+        let views: Vec<Value> = schema
+            .tables
+            .iter()
+            .map(|view| {
+                json!({
+                    "name": view.name,
+                    "columns": view.columns.iter().map(|column| json!({
+                        "name": column.name,
+                        "type": column.kind,
+                        "not_null": column.not_null,
+                        "primary_key": column.primary_key,
+                        "default": column.default,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "connection": connection.name,
+                "driver": connection.driver,
+                "views": views,
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{} ({})", connection.name, connection.driver);
+    if schema.tables.is_empty() {
+        println!("  (no views)");
+        return Ok(());
+    }
+    for view in &schema.tables {
+        println!("  {}", view.name);
+        let width = view
+            .columns
+            .iter()
+            .map(|column| column.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for column in &view.columns {
+            let kind = if column.kind.is_empty() {
+                "-"
+            } else {
+                column.kind.as_str()
+            };
+            println!("    {:width$}  {kind}", column.name, width = width);
         }
     }
     Ok(())

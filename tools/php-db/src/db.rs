@@ -228,6 +228,122 @@ pub fn exec(connection: &Connection, command: &str) -> Result<String> {
 // Command construction (public so tests can inspect argv and environment)
 // ---------------------------------------------------------------------------
 
+pub fn databases(connection: &Connection, base: &Path) -> Result<Vec<String>> {
+    let driver = connection.driver()?;
+    match driver {
+        Driver::Sqlite => {
+            let path = sqlite_database(connection, base)?;
+            Ok(vec![file_database_name(&path)])
+        }
+        // The oracle fallback names are derived from the config without
+        // spawning sqlplus, so the client is required per-runnable arm.
+        Driver::Postgres => {
+            require_client(driver)?;
+            let (command, _) = build_query_command(connection, base, PG_DATABASES_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            names_from_csv(&String::from_utf8_lossy(&output.stdout))
+        }
+        Driver::Mysql | Driver::MariaDb => {
+            require_client(driver)?;
+            let (command, _) = build_query_command(connection, base, MYSQL_DATABASES_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            Ok(names_from_tsv(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::SqlServer => {
+            require_client(driver)?;
+            let (command, _) = build_query_command(connection, base, SQLSERVER_DATABASES_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            Ok(names_from_tsv(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::Oracle => {
+            let name = connection
+                .database
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| {
+                    // Service name from a url like `user@host:1521/service`.
+                    connection
+                        .url
+                        .as_deref()
+                        .and_then(|url| url.split('/').last())
+                        .filter(|service| {
+                            !service.is_empty() && !service.starts_with('!') && !service.contains('?')
+                        })
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    connection
+                        .user
+                        .clone()
+                        .filter(|user| !user.is_empty())
+                })
+                .or_else(|| connection.url_username())
+                .with_context(|| {
+                    format!("oracle connection `{}` has no database name", connection.name)
+                })?;
+            Ok(vec![name])
+        }
+        Driver::Mongodb => {
+            require_client(driver)?;
+            let (command, _) = build_exec_command(
+                connection,
+                "db.adminCommand({ listDatabases: 1 }).databases.forEach(d => print(d.name))",
+            )?;
+            let output = run(command, driver.client(), None)?;
+            Ok(names_from_lines(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::Redis => Ok(vec![redis_database_name(connection)]),
+    }
+}
+
+pub fn views(connection: &Connection, base: &Path) -> Result<Schema> {
+    let driver = connection.driver()?;
+    require_client(driver)?;
+    match driver {
+        Driver::Sqlite => sqlite_views(connection, base),
+        Driver::Postgres => {
+            let (command, _) = build_query_command(connection, base, PG_VIEWS_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            Ok(names_schema(
+                names_from_csv(&String::from_utf8_lossy(&output.stdout))?,
+            ))
+        }
+        Driver::Mysql | Driver::MariaDb => {
+            let (command, _) = build_query_command(connection, base, MYSQL_VIEWS_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            Ok(schema_from_tsv(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::SqlServer => {
+            let (command, _) = build_query_command(connection, base, SQLSERVER_VIEWS_SQL)?;
+            let output = run(command, driver.client(), None)?;
+            Ok(schema_from_tsv(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::Oracle => {
+            let target = oracle_target(connection)?;
+            let (command, stdin) = (
+                sqlplus_command(),
+                Some(oracle_script(
+                    &target,
+                    "SELECT view_name FROM user_views ORDER BY view_name",
+                )),
+            );
+            let output = run(command, driver.client(), stdin.as_deref())?;
+            Ok(names_schema(
+                names_from_csv(&String::from_utf8_lossy(&output.stdout))?,
+            ))
+        }
+        Driver::Mongodb => {
+            let (command, _) = build_exec_command(
+                connection,
+                "db.getCollectionInfos({ type: 'view' }).forEach(c => print(c.name))",
+            )?;
+            let output = run(command, driver.client(), None)?;
+            Ok(schema_from_lines(&String::from_utf8_lossy(&output.stdout)))
+        }
+        Driver::Redis => Ok(Schema { tables: Vec::new() }),
+    }
+}
+
 pub fn build_check_command(
     connection: &Connection,
     base: &Path,
@@ -416,6 +532,14 @@ fn sqlite_command(path: &Path, sql: &str) -> Command {
 }
 
 fn sqlite_schema(connection: &Connection, base: &Path) -> Result<Schema> {
+    sqlite_relations(connection, base, "table")
+}
+
+fn sqlite_views(connection: &Connection, base: &Path) -> Result<Schema> {
+    sqlite_relations(connection, base, "view")
+}
+
+fn sqlite_relations(connection: &Connection, base: &Path, kind: &str) -> Result<Schema> {
     let path = connection.sqlite_path(base)?;
     if !path.is_file() {
         bail!(
@@ -423,13 +547,16 @@ fn sqlite_schema(connection: &Connection, base: &Path) -> Result<Schema> {
             path.display()
         );
     }
-    let table_rows = sqlite_rows(
+    let relation_rows = sqlite_rows(
         &path,
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        &format!(
+            "SELECT name FROM sqlite_schema WHERE type = '{kind}' \
+             AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ),
     )?;
 
-    let mut tables = Vec::with_capacity(table_rows.len());
-    for row in table_rows {
+    let mut tables = Vec::with_capacity(relation_rows.len());
+    for row in relation_rows {
         let name = string_field(&row, "name");
         if name.is_empty() {
             continue;
@@ -508,6 +635,65 @@ fn string_field(row: &Map<String, Value>, key: &str) -> String {
         Some(other) => other.to_string(),
     }
 }
+
+fn file_database_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn redis_database_name(connection: &Connection) -> String {
+    connection
+        .database
+        .as_deref()
+        .filter(|database| !database.is_empty())
+        .unwrap_or("db0")
+        .to_string()
+}
+
+fn names_schema(names: Vec<String>) -> Schema {
+    Schema {
+        tables: names
+            .into_iter()
+            .map(|name| Table {
+                name,
+                columns: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn names_from_csv(text: &str) -> Result<Vec<String>> {
+    let result = csv_to_result(text)?;
+    Ok(result
+        .rows
+        .iter()
+        .filter_map(|row| row.first())
+        .filter_map(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn names_from_tsv(text: &str) -> Vec<String> {
+    tsv_to_result(text)
+        .rows
+        .iter()
+        .filter_map(|row| row.first())
+        .filter_map(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn names_from_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 
 fn integer_field(row: &Map<String, Value>, key: &str) -> i64 {
     match row.get(key) {
@@ -752,6 +938,39 @@ SELECT CASE
        END AS name
 FROM INFORMATION_SCHEMA.TABLES
 WHERE TABLE_TYPE = 'BASE TABLE'
+ORDER BY name";
+
+const SQLSERVER_DATABASES_SQL: &str = "\
+SELECT name FROM sys.databases
+WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
+ORDER BY name";
+
+const MYSQL_DATABASES_SQL: &str = "\
+SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys')
+ORDER BY SCHEMA_NAME";
+
+const PG_DATABASES_SQL: &str = "\
+SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname";
+
+const SQLSERVER_VIEWS_SQL: &str = "\
+SET NOCOUNT ON;
+SELECT CASE
+         WHEN TABLE_SCHEMA = 'dbo' THEN TABLE_NAME
+         ELSE TABLE_SCHEMA + '.' + TABLE_NAME
+       END AS name
+FROM INFORMATION_SCHEMA.VIEWS
+WHERE TABLE_SCHEMA NOT IN ('sys', 'INFORMATION_SCHEMA')
+ORDER BY name";
+
+const MYSQL_VIEWS_SQL: &str = "SHOW FULL TABLES WHERE Table_type = 'VIEW'";
+
+const PG_VIEWS_SQL: &str = "\
+SELECT c.relname AS name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public'
+  AND c.relkind = 'v'
 ORDER BY name";
 
 struct SqlServerTarget {
@@ -1530,6 +1749,139 @@ mod tests {
         let args = args(&command);
         assert!(args.windows(2).any(|pair| pair == ["SET", "greeting"]));
         assert!(args.iter().any(|arg| arg == "hello world"));
+    }
+
+    #[test]
+    fn sqlite_databases_and_views() {
+        let connection = connection(r#"{"name":"app","driver":"sqlite","path":"demo.sqlite"}"#);
+        let names = databases(&connection, &base()).unwrap();
+        assert_eq!(names, vec!["demo.sqlite"]);
+
+        let views = views(&connection, &base()).unwrap();
+        assert!(views.tables.is_empty());
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "php-db-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tmp_sqlite_reports_databases_and_view_columns() {
+        let directory = tempfile_dir();
+        let path = directory.join("scratch.sqlite");
+        Command::new("sqlite3")
+            .arg(&path)
+            .arg("CREATE TABLE t (id INTEGER PRIMARY KEY, note TEXT); CREATE VIEW big AS SELECT id, note FROM t WHERE id > 1;")
+            .status()
+            .expect("sqlite3 CLI");
+        let connection = serde_json::from_str(&format!(
+            r#"{{"name":"scratch","driver":"sqlite","path":"{}"}}"#,
+            path.display()
+        ))
+        .unwrap();
+        let names = databases(&connection, &path.parent().unwrap()).unwrap();
+        assert_eq!(names, vec!["scratch.sqlite".to_string()]);
+
+        let views = views(&connection, &directory).unwrap();
+        let view = views.tables.first().expect("one view");
+        assert_eq!(view.name, "big");
+        assert_eq!(
+            view.columns.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["id", "note"]
+        );
+    }
+
+    #[test]
+    fn redis_databases_uses_database_field_or_db0() {
+        let with_db = connection(
+            r#"{"name":"cache","driver":"redis","host":"127.0.0.1","database":"3"}"#,
+        );
+        assert_eq!(
+            redis_database_name(&with_db),
+            "3"
+        );
+        let without_db = connection(r#"{"name":"cache","driver":"redis","host":"127.0.0.1"}"#);
+        assert_eq!(redis_database_name(&without_db), "db0");
+    }
+
+    #[test]
+    fn oracle_databases_falls_back_to_database_then_user() {
+        let with_database =
+            connection(r#"{"name":"ora","driver":"oracle","url":"u@h:1521/svc"}"#);
+        assert_eq!(
+            databases(&with_database, Path::new(".")).unwrap(),
+            vec!["svc"]
+        );
+        let with_user = connection(r#"{"name":"ora","driver":"oracle","host":"h","user":"u"}"#);
+        assert_eq!(databases(&with_user, Path::new(".")).unwrap(), vec!["u"]);
+    }
+
+    #[test]
+    fn builds_databases_queries_per_server_driver() {
+        let cases = [
+            (
+                r#"{"name":"pg","driver":"postgres","url":"postgres://h/db"}"#,
+                "psql",
+                PG_DATABASES_SQL,
+            ),
+            (
+                r#"{"name":"my","driver":"mysql","host":"h","database":"d"}"#,
+                "mysql",
+                MYSQL_DATABASES_SQL,
+            ),
+            (
+                r#"{"name":"ms","driver":"sqlserver","host":"h","database":"d"}"#,
+                "sqlcmd",
+                SQLSERVER_DATABASES_SQL,
+            ),
+        ];
+        for (json, program, sql) in cases {
+            let c = connection(json);
+            let (command, stdin) =
+                build_query_command(&c, Path::new("."), match c.driver().unwrap() {
+                    Driver::Postgres => PG_DATABASES_SQL,
+                    Driver::Mysql => MYSQL_DATABASES_SQL,
+                    Driver::SqlServer => SQLSERVER_DATABASES_SQL,
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            assert_eq!(command.get_program(), OsStr::new(program), "{json}");
+            assert!(stdin.is_none(), "{json}");
+            let argv = args(&command);
+            assert!(argv.iter().any(|arg| arg.contains(&sql[..12])), "{json}");
+        }
+    }
+
+    #[test]
+    fn mongodb_databases_uses_admin_command() {
+        let connection = connection(r#"{"name":"mongo","driver":"mongodb","host":"h"}"#);
+        let (command, _) =
+            build_exec_command(&connection, "db.adminCommand({ listDatabases: 1 }).databases.forEach(d => print(d.name))").unwrap();
+        assert_eq!(command.get_program(), OsStr::new("mongosh"));
+        let argv = args(&command);
+        assert!(argv.iter().any(|arg| arg.contains("adminCommand")));
+    }
+
+    #[test]
+    fn names_helpers_parse_client_output() {
+        assert_eq!(
+            names_from_csv("name\nalpha\nbeta\n").unwrap(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            names_from_tsv("Tables_in_db\tTable_type\nv1\tVIEW\n"),
+            vec!["v1"]
+        );
+        assert_eq!(
+            names_from_lines("one\n\n  two \n"),
+            vec!["one", "two"]
+        );
     }
 
     #[test]
