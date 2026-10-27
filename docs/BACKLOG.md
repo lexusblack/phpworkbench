@@ -34,7 +34,7 @@
 - [~] Панель Databases: подключения + схема (таблицы/колонки); нет грида и SQL-консоли
 - [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
 - [ ] Composer-панель (add/remove/outdated)
-- [ ] Gutter-запуск PHPUnit/Pest + coverage
+- [~] Движок php-test (PHPUnit/Pest через JUnit); gutter-запуск и coverage не сделаны
 - [ ] Run configurations
 
 ## Фаза 4. Рефакторинги и инспекции
@@ -53,7 +53,7 @@
 ## Фаза 5. Remote, deploy UI, profiler
 
 - [~] Движок деплоя (local/sftp, watch)
-- [~] Remote: листинг/скачивание/удаление в CLI; дерева в UI нет
+- [~] Remote: дерево в UI (root/nested), скачивание и открытие; клик по вложенному файлу не проверен
 - [ ] Редактор удалённых файлов
 - [ ] Окно настроек деплоя (GPUI-модал)
 - [ ] Upload-on-save через событие `BufferEvent::Saved`
