@@ -45,7 +45,7 @@
 - [ ] Change signature
 - [ ] Pull up / push down / extract interface
 - [ ] Превью и undo рефакторинга
-- [~] PHPStan LSP на open/save; Psalm и debounce не сделаны
+- [~] PHPStan + Psalm LSP на open/save; debounce и quick fixes не сделаны
 - [ ] PSR-12 и миграционные инспекции
 - [ ] Coverage
 - [ ] Local History
