@@ -31,9 +31,9 @@
 - [~] Аудит зависимостей (`deps-audit`) + LSP-подсветка
 - [~] Деплой (`php-deploy`) — local/sftp, sync/upload/watch
 - [~] Панель Remote в правом доке: список серверов + вызов sync (клик не проверен автоматически)
-- [~] Панель Databases: подключения + схема (таблицы/колонки); нет грида и SQL-консоли
+- [x] Панель Databases: подключения, схема, грид данных и SQL-консоль (чтение)
 - [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
-- [ ] Composer-панель (add/remove/outdated)
+- [~] Composer: движок php-composer (list/outdated/validate/scripts/require/remove); UI-панели нет
 - [~] Движок php-test (PHPUnit/Pest через JUnit); gutter-запуск и coverage не сделаны
 - [ ] Run configurations
 
