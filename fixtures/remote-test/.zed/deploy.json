@@ -18,5 +18,6 @@
       "local_root": ".",
       "exclude": []
     }
-  ]
+  ],
+  "active": "local"
 }
