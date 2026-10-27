@@ -1,6 +1,6 @@
 {
     "name": "phpstorm/lint-fixture",
-    "description": "Fixture project for the php-lint PHPStan bridge",
+    "description": "Fixture project for the php-lint PHPStan/Psalm bridge",
     "type": "project",
     "license": "MIT",
     "autoload": {
@@ -9,7 +9,8 @@
         }
     },
     "require-dev": {
-        "phpstan/phpstan": "^2.3"
+        "phpstan/phpstan": "^2.3",
+        "vimeo/psalm": "^6.20"
     },
     "config": {
         "sort-packages": true

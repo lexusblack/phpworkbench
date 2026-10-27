@@ -83,6 +83,79 @@
           }
         }
       ]
+    },
+    {
+      "name": "Bodies",
+      "item": [
+        {
+          "id": "req-urlencoded",
+          "name": "POST urlencoded",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "urlencoded",
+              "urlencoded": [
+                { "key": "full name", "value": "Ada Lovelace", "type": "text" },
+                { "key": "note", "value": "a+b & c=d", "type": "text" },
+                { "key": "skip", "value": "nope", "type": "text", "disabled": true }
+              ]
+            },
+            "url": {
+              "raw": "{{host}}/echo/urlencoded",
+              "host": ["{{host}}"],
+              "path": ["echo", "urlencoded"]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                { "key": "token", "value": "{{token}}", "type": "string" }
+              ]
+            }
+          }
+        },
+        {
+          "id": "req-formdata",
+          "name": "POST formdata",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "title", "value": "hello", "type": "text" },
+                { "key": "full name", "value": "Ada Lovelace", "type": "text" },
+                { "key": "upload", "type": "file", "src": "upload.txt" }
+              ]
+            },
+            "url": {
+              "raw": "{{host}}/echo/formdata",
+              "host": ["{{host}}"],
+              "path": ["echo", "formdata"]
+            }
+          }
+        },
+        {
+          "id": "req-graphql",
+          "name": "POST graphql",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "graphql",
+              "graphql": {
+                "query": "query($id: Int!) { item(id: $id) { name } }",
+                "variables": "{\"id\": 7}"
+              }
+            },
+            "url": {
+              "raw": "{{host}}/echo/graphql",
+              "host": ["{{host}}"],
+              "path": ["echo", "graphql"]
+            }
+          }
+        }
+      ]
     }
   ]
 }

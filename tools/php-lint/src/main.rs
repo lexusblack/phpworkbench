@@ -5,8 +5,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use php_lint::{
-    analyse_path, human_exit_code, normalize, parse_args, render_human, resolve_phpstan,
-    validate_dir, CheckOptions, Invocation, Report,
+    analyse_path, human_exit_code, normalize, normalize_psalm, parse_args, render_human,
+    requested_tool, resolve_phpstan, resolve_psalm, resolve_tool, validate_dir, CheckOptions,
+    Invocation, Report, Tool,
 };
 use serde_json::{json, Value};
 
@@ -24,7 +25,8 @@ fn main() {
 
 fn run(args: &[String]) -> Result<i32> {
     if args.iter().any(|arg| arg == "--lsp") {
-        run_lsp()?;
+        let tool = parse_lsp_tool(args)?;
+        run_lsp(tool)?;
         return Ok(0);
     }
     match parse_args(args.iter().cloned())? {
@@ -34,6 +36,22 @@ fn run(args: &[String]) -> Result<i32> {
         }
         Invocation::Check(options) => check(&options),
     }
+}
+
+fn parse_lsp_tool(args: &[String]) -> Result<Option<Tool>> {
+    let mut tool = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--lsp" => {}
+            "--tool" => {
+                let value = iter.next().with_context(|| "missing value for --tool")?;
+                tool = Some(Tool::parse(value)?);
+            }
+            other => bail!("unknown option '{other}' with --lsp\n\n{}", php_lint::USAGE),
+        }
+    }
+    Ok(tool)
 }
 
 fn check(options: &CheckOptions) -> Result<i32> {
@@ -51,6 +69,15 @@ fn check(options: &CheckOptions) -> Result<i32> {
 fn analyse(options: &CheckOptions) -> Result<Report> {
     validate_dir(&options.dir)?;
     validate_file(options)?;
+
+    match resolve_tool(options)? {
+        Tool::Phpstan => analyse_phpstan(options),
+        Tool::Psalm => analyse_psalm(options),
+        Tool::Auto => unreachable!("auto is resolved to a concrete tool"),
+    }
+}
+
+fn analyse_phpstan(options: &CheckOptions) -> Result<Report> {
     let phpstan = resolve_phpstan(options)?;
 
     let mut command = Command::new(&phpstan);
@@ -93,7 +120,44 @@ fn analyse(options: &CheckOptions) -> Result<Report> {
     }
 }
 
-fn run_lsp() -> Result<()> {
+fn analyse_psalm(options: &CheckOptions) -> Result<Report> {
+    let psalm = resolve_psalm(options)?;
+
+    let output = Command::new(&psalm)
+        .current_dir(&options.dir)
+        .arg("--output-format=json")
+        .arg("--no-progress")
+        .arg("--no-cache")
+        .arg(format!("--memory-limit={}", options.memory))
+        .arg(analyse_path(options))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run Psalm at {}.\n\
+                 Install it with: composer require --dev vimeo/psalm",
+                psalm.display()
+            )
+        })?;
+
+    let exit_code = output.status.code().unwrap_or(2);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    match normalize_psalm(&stdout, exit_code) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let trimmed = stderr.trim();
+            if trimmed.is_empty() {
+                bail!("{error}");
+            }
+            bail!("{error}\nPsalm stderr:\n{trimmed}")
+        }
+    }
+}
+
+fn run_lsp(requested: Option<Tool>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
@@ -133,7 +197,7 @@ fn run_lsp() -> Result<()> {
             }
             "exit" => break,
             "textDocument/didOpen" | "textDocument/didSave" => {
-                if let Err(error) = publish_diagnostics(&mut writer, &params) {
+                if let Err(error) = publish_diagnostics(&mut writer, &params, requested) {
                     eprintln!("php-lint lsp: {error:#}");
                 }
             }
@@ -185,7 +249,11 @@ fn write_message<W: Write>(writer: &mut W, message: &Value) -> Result<()> {
     Ok(())
 }
 
-fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
+fn publish_diagnostics<W: Write>(
+    writer: &mut W,
+    params: &Value,
+    requested: Option<Tool>,
+) -> Result<()> {
     let Some(uri) = params
         .get("textDocument")
         .and_then(|document| document.get("uri"))
@@ -200,12 +268,21 @@ fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
         return Ok(());
     }
 
-    let Some(dir) = find_project_dir(&path) else {
+    let requested = requested_tool(requested, false)?;
+    let Some(dir) = find_project_dir(&path, requested) else {
         eprintln!(
-            "php-lint lsp: no phpstan.neon or phpstan.neon.dist found for {}",
+            "php-lint lsp: no phpstan.neon, phpstan.neon.dist, psalm.xml, or psalm.xml.dist found for {}",
             path.display()
         );
         return Ok(());
+    };
+
+    let tool = match php_lint::select_tool(requested, &dir) {
+        Ok(tool) => tool,
+        Err(error) => {
+            eprintln!("php-lint lsp: {error:#}");
+            return Ok(());
+        }
     };
 
     let options = CheckOptions {
@@ -213,8 +290,9 @@ fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
         file: Some(path.clone()),
         level: None,
         json: false,
-        memory: "1G".to_string(),
+        memory: "2G".to_string(),
         phpstan: None,
+        tool: Some(tool),
     };
 
     let report = match analyse(&options) {
@@ -240,8 +318,8 @@ fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
                     "start": { "line": line, "character": 0 },
                     "end": { "line": line, "character": end },
                 },
-                "severity": 1,
-                "source": "phpstan",
+                "severity": lsp_severity(&error.severity),
+                "source": report.tool,
                 "message": error.message,
             });
             if let Some(identifier) = &error.identifier {
@@ -261,16 +339,34 @@ fn publish_diagnostics<W: Write>(writer: &mut W, params: &Value) -> Result<()> {
     )
 }
 
+fn lsp_severity(severity: &str) -> u8 {
+    match severity {
+        "warning" => 2,
+        "info" => 3,
+        _ => 1,
+    }
+}
+
 fn read_lines(path: &Path) -> Vec<String> {
     fs::read_to_string(path)
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default()
 }
 
-fn find_project_dir(file: &Path) -> Option<PathBuf> {
+fn find_project_dir(file: &Path, requested: Tool) -> Option<PathBuf> {
+    let configs: &[&str] = match requested {
+        Tool::Phpstan => &["phpstan.neon", "phpstan.neon.dist"],
+        Tool::Psalm => &["psalm.xml", "psalm.xml.dist"],
+        Tool::Auto => &[
+            "phpstan.neon",
+            "phpstan.neon.dist",
+            "psalm.xml",
+            "psalm.xml.dist",
+        ],
+    };
     let mut dir = file.parent()?.to_path_buf();
     loop {
-        if dir.join("phpstan.neon").is_file() || dir.join("phpstan.neon.dist").is_file() {
+        if configs.iter().any(|config| dir.join(config).is_file()) {
             return Some(dir);
         }
         if !dir.pop() {

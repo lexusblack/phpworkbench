@@ -32,9 +32,17 @@ impl Drop for TempDir {
 }
 
 fn fake_phpstan(dir: &Path) {
+    fake_binary(dir, "phpstan");
+}
+
+fn fake_psalm(dir: &Path) {
+    fake_binary(dir, "psalm");
+}
+
+fn fake_binary(dir: &Path, name: &str) {
     let bin = dir.join("vendor/bin");
     fs::create_dir_all(&bin).unwrap();
-    let script = bin.join("phpstan");
+    let script = bin.join(name);
     fs::write(
         &script,
         "#!/bin/sh\n\
@@ -70,6 +78,92 @@ fn run(dir: &Path, args: &[&str], json: &str, exit: i32) -> (Output, Vec<String>
 
 const ONE_ERROR: &str = r#"{"totals":{"errors":0,"file_errors":1},"files":{"/p/src/Broken.php":{"errors":1,"messages":[{"message":"Undefined variable: $x","line":7,"ignorable":true,"identifier":"variable.undefined"}]}},"errors":[]}"#;
 const CLEAN: &str = r#"{"totals":{"errors":0,"file_errors":0},"files":{},"errors":[]}"#;
+const PSALM_ONE_ERROR: &str = r#"[{"severity":"error","line_from":7,"type":"UndefinedVariable","message":"Cannot find referenced variable $x","file_name":"src/Broken.php","file_path":"/p/src/Broken.php"}]"#;
+
+#[test]
+fn runs_psalm_and_emits_normalized_json() {
+    let temp = TempDir::new("psalm");
+    fake_psalm(temp.path());
+
+    let (output, recorded) = run(
+        temp.path(),
+        &["check", "--tool", "psalm", "--json"],
+        PSALM_ONE_ERROR,
+        0,
+    );
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tool"], "psalm");
+    assert_eq!(report["totals"]["files"], 1);
+    assert_eq!(report["totals"]["errors"], 1);
+    assert_eq!(report["errors"][0]["identifier"], "UndefinedVariable");
+    assert_eq!(report["errors"][0]["severity"], "error");
+    assert_eq!(report["errors"][0]["line"], 7);
+
+    assert!(recorded.contains(&"--output-format=json".to_string()));
+    assert!(recorded.contains(&"--no-progress".to_string()));
+    assert!(recorded.contains(&"--no-cache".to_string()));
+    assert!(recorded.contains(&"--memory-limit=1G".to_string()));
+    assert!(recorded.contains(&".".to_string()));
+}
+
+#[test]
+fn auto_falls_back_to_psalm() {
+    let temp = TempDir::new("psalm-auto");
+    fake_psalm(temp.path());
+
+    let (output, recorded) = run(temp.path(), &["check", "--json"], PSALM_ONE_ERROR, 0);
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tool"], "psalm");
+    assert!(recorded.contains(&"--output-format=json".to_string()));
+}
+
+#[test]
+fn env_selects_psalm_when_both_tools_exist() {
+    let temp = TempDir::new("psalm-env");
+    fake_phpstan(temp.path());
+    fake_psalm(temp.path());
+    let args_file = temp.path().join("args.txt");
+    let json_file = temp.path().join("result.json");
+    fs::write(&json_file, PSALM_ONE_ERROR).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_php-lint"))
+        .current_dir(temp.path())
+        .args(["check", "--json"])
+        .env("PHP_LINT_TOOL", "psalm")
+        .env("FAKE_ARGS_FILE", &args_file)
+        .env("FAKE_JSON_FILE", &json_file)
+        .env("FAKE_EXIT_CODE", "0")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["tool"], "psalm");
+}
+
+#[test]
+fn missing_psalm_exits_two_with_install_hint() {
+    let temp = TempDir::new("psalm-missing");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_php-lint"))
+        .current_dir(temp.path())
+        .args(["check", "--tool", "psalm"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Psalm not found"), "{stderr}");
+    assert!(
+        stderr.contains("composer require --dev vimeo/psalm"),
+        "{stderr}"
+    );
+}
 
 #[test]
 fn discovers_phpstan_and_emits_normalized_json() {

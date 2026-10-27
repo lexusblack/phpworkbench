@@ -2,9 +2,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::{execute, interpolate, unresolved_var, ExecResult, Request};
+use crate::{
+    append_history, execute, interpolate, unresolved_var, Body, ExecResult, FormField, Request,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiKeyLocation {
@@ -31,10 +33,11 @@ pub struct RequestSpec {
     pub method: String,
     pub url: String,
     pub headers: Vec<(String, String)>,
-    pub body: Option<String>,
+    pub body: Option<Body>,
     pub auth: Option<Auth>,
     pub folder_vars: Vec<(String, String)>,
     pub request_vars: Vec<(String, String)>,
+    pub base_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,7 +47,12 @@ pub struct Collection {
     pub requests: Vec<RequestSpec>,
 }
 
+#[cfg(test)]
 pub fn parse_collection(content: &str) -> Result<Collection> {
+    parse_collection_at(content, PathBuf::from("."))
+}
+
+pub fn parse_collection_at(content: &str, base_dir: PathBuf) -> Result<Collection> {
     let root: Value = serde_json::from_str(content).context("collection is not valid JSON")?;
     if !root.is_object() {
         bail!("collection root must be a JSON object");
@@ -63,7 +71,15 @@ pub fn parse_collection(content: &str) -> Result<Collection> {
     let mut seen = HashSet::new();
     if let Some(items) = root.get("item").and_then(Value::as_array) {
         for item in items {
-            flatten_item(item, &[], &[], &root_auth, &mut requests, &mut seen);
+            flatten_item(
+                item,
+                &[],
+                &[],
+                &root_auth,
+                &base_dir,
+                &mut requests,
+                &mut seen,
+            )?;
         }
     }
 
@@ -79,11 +95,12 @@ fn flatten_item(
     folder_path: &[String],
     folder_vars: &[(String, String)],
     inherited_auth: &Option<Auth>,
+    base_dir: &Path,
     out: &mut Vec<RequestSpec>,
     seen: &mut HashSet<String>,
-) {
+) -> Result<()> {
     let Some(obj) = item.as_object() else {
-        return;
+        return Ok(());
     };
     let item_name = obj
         .get("name")
@@ -102,19 +119,28 @@ fn flatten_item(
         let mut next_vars = folder_vars.to_vec();
         merge_pairs(&mut next_vars, parse_vars(obj.get("variable")));
         for child in children {
-            flatten_item(child, &next_path, &next_vars, &auth, out, seen);
+            flatten_item(
+                child,
+                &next_path,
+                &next_vars,
+                &auth,
+                base_dir,
+                out,
+                seen,
+            )?;
         }
-        return;
+        return Ok(());
     }
 
     let Some(request) = obj.get("request") else {
-        return;
+        return Ok(());
     };
-    let Ok(Some(spec)) = parse_request(obj, request, folder_path, folder_vars, &auth) else {
-        return;
+    let Some(spec) = parse_request(obj, request, folder_path, folder_vars, &auth, base_dir)? else {
+        return Ok(());
     };
     let id = unique_id(spec.id, seen);
     out.push(RequestSpec { id, ..spec });
+    Ok(())
 }
 
 fn parse_request(
@@ -123,8 +149,9 @@ fn parse_request(
     folder_path: &[String],
     folder_vars: &[(String, String)],
     inherited_auth: &Option<Auth>,
+    base_dir: &Path,
 ) -> Result<Option<RequestSpec>> {
-    let (method, url, mut headers, body, request_auth) = match request {
+    let (method, url, mut headers, body_and_ct, request_auth) = match request {
         Value::String(url) => ("GET".to_string(), url.clone(), Vec::new(), None, None),
         Value::Object(obj) => (
             obj.get("method")
@@ -133,7 +160,7 @@ fn parse_request(
                 .to_ascii_uppercase(),
             build_url(obj.get("url")),
             parse_headers(obj.get("header")),
-            parse_body(obj.get("body")),
+            parse_body(obj.get("body"))?,
             obj.get("auth"),
         ),
         _ => return Ok(None),
@@ -143,16 +170,16 @@ fn parse_request(
         return Ok(None);
     }
 
-    if let Some(body) = &body {
+    let (body, body_content_type) = match body_and_ct {
+        Some((body, content_type)) => (Some(body), content_type),
+        None => (None, None),
+    };
+
+    if let Some(content_type) = body_content_type {
         let has_content_type = headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
         if !has_content_type {
-            let content_type = if serde_json::from_str::<Value>(body).is_ok() {
-                "application/json"
-            } else {
-                "text/plain"
-            };
             headers.push(("Content-Type".to_string(), content_type.to_string()));
         }
     }
@@ -207,6 +234,7 @@ fn parse_request(
         auth,
         folder_vars: folder_vars.to_vec(),
         request_vars,
+        base_dir: base_dir.to_path_buf(),
     }))
 }
 
@@ -335,17 +363,129 @@ fn parse_headers(value: Option<&Value>) -> Vec<(String, String)> {
     out
 }
 
-fn parse_body(value: Option<&Value>) -> Option<String> {
-    let obj = value?.as_object()?;
-    if obj.get("mode").and_then(Value::as_str) != Some("raw") {
-        return None;
+fn parse_body(value: Option<&Value>) -> Result<Option<(Body, Option<&'static str>)>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(obj) = value.as_object() else {
+        bail!("request body must be a JSON object");
+    };
+    let Some(mode) = obj.get("mode").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    match mode {
+        "raw" => {
+            let raw = obj.get("raw").and_then(Value::as_str).unwrap_or("");
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            let content_type = if serde_json::from_str::<Value>(raw).is_ok() {
+                "application/json"
+            } else {
+                "text/plain"
+            };
+            Ok(Some((Body::Raw(raw.to_string()), Some(content_type))))
+        }
+        "urlencoded" => {
+            let fields = parse_urlencoded(obj.get("urlencoded"));
+            Ok(Some((
+                Body::UrlEncoded(fields),
+                Some("application/x-www-form-urlencoded"),
+            )))
+        }
+        "formdata" => Ok(Some((Body::FormData(parse_formdata(obj.get("formdata"))?), None))),
+        "graphql" => {
+            let graphql = obj.get("graphql").and_then(Value::as_object);
+            let query = graphql
+                .and_then(|g| g.get("query"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let variables = match graphql.and_then(|g| g.get("variables")) {
+                Some(Value::String(text)) => text.clone(),
+                Some(value @ Value::Object(_)) | Some(value @ Value::Array(_)) => value.to_string(),
+                _ => String::new(),
+            };
+            Ok(Some((
+                Body::GraphQL { query, variables },
+                Some("application/json"),
+            )))
+        }
+        other => bail!("unsupported Postman body mode: {}", other),
     }
-    let raw = obj.get("raw").and_then(Value::as_str)?;
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw.to_string())
+}
+
+fn parse_urlencoded(value: Option<&Value>) -> Vec<(String, String)> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if obj.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(key) = obj.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        out.push((key.to_string(), scalar(obj.get("value"))));
     }
+    out
+}
+
+fn parse_formdata(value: Option<&Value>) -> Result<Vec<FormField>> {
+    let Some(Value::Array(items)) = value else {
+        return Ok(Vec::new());
+    };
+    let mut fields = Vec::new();
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        if obj.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(key) = obj.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let is_file = obj.get("type").and_then(Value::as_str) == Some("file");
+        if is_file {
+            let src = match obj.get("src") {
+                Some(Value::String(src)) => src.clone(),
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                _ => String::new(),
+            };
+            if src.is_empty() {
+                bail!("form-data file field '{}' has no src", key);
+            }
+            fields.push(FormField {
+                key: key.to_string(),
+                value: src,
+                is_file: true,
+            });
+        } else {
+            fields.push(FormField {
+                key: key.to_string(),
+                value: scalar(obj.get("value")),
+                is_file: false,
+            });
+        }
+    }
+    Ok(fields)
 }
 
 fn parse_vars(value: Option<&Value>) -> Vec<(String, String)> {
@@ -725,6 +865,7 @@ fn run_collection(args: &[String]) -> Result<()> {
     let mut follow = false;
     let mut env_file: Option<String> = None;
     let mut overrides = Vec::new();
+    let mut history: Option<String> = None;
 
     let mut i = 2;
     while i < args.len() {
@@ -741,6 +882,10 @@ fn run_collection(args: &[String]) -> Result<()> {
             "--json" => as_json = true,
             "--fail-fast" => fail_fast = true,
             "--follow" => follow = true,
+            "--history" => {
+                i += 1;
+                history = Some(args.get(i).context("--history requires a file")?.clone());
+            }
             "--env" => {
                 i += 1;
                 env_file = Some(args.get(i).context("--env requires a file")?.clone());
@@ -780,13 +925,21 @@ fn run_collection(args: &[String]) -> Result<()> {
             as_json,
             fail_fast,
             follow,
+            history.as_deref(),
         );
     }
 
     let wanted = request_name.unwrap();
     let request = find_request(&collection, &wanted)?;
     let vars = vars_for_request(&collection, request, &env, &overrides);
-    execute_request(request, &vars, follow, as_json)?;
+    execute_request(
+        &collection,
+        request,
+        &vars,
+        follow,
+        as_json,
+        history.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -797,6 +950,7 @@ fn run_all(
     as_json: bool,
     fail_fast: bool,
     follow: bool,
+    history: Option<&str>,
 ) -> Result<()> {
     let mut results: Vec<Outcome> = Vec::new();
     let mut stopped_early = false;
@@ -823,6 +977,17 @@ fn run_all(
             Ok(result) => Outcome::ok(request, url, result),
             Err(err) => Outcome::failed(request, url, err.to_string()),
         };
+        if let (Some(path), Some(result)) = (history, outcome.result.as_ref()) {
+            append_history(
+                Path::new(path),
+                &collection.name,
+                &outcome.id,
+                &outcome.name,
+                &outcome.method,
+                &outcome.url,
+                result,
+            )?;
+        }
         let failed = outcome.is_failed();
         results.push(outcome);
         if fail_fast && failed {
@@ -900,19 +1065,33 @@ impl Outcome {
 }
 
 fn execute_request(
+    collection: &Collection,
     request: &RequestSpec,
     vars: &HashMap<String, String>,
     follow: bool,
     as_json: bool,
+    history: Option<&str>,
 ) -> Result<()> {
     let result = execute_prepared(request, vars, follow)?;
+    let url = resolved_url(request, vars);
+    if let Some(path) = history {
+        append_history(
+            Path::new(path),
+            &collection.name,
+            &request.id,
+            &request.name,
+            &request.method,
+            &url,
+            &result,
+        )?;
+    }
     if as_json {
         let value = json_result(
             &request.id,
             &request.name,
             &request.folder,
             &request.method,
-            &resolved_url(request, vars),
+            &url,
             &result,
             None,
         );
@@ -940,6 +1119,7 @@ fn execute_prepared(
         url,
         headers,
         body: request.body.clone(),
+        body_dir: request.base_dir.clone(),
     };
     execute(&prepared, vars, follow)
 }
@@ -1152,11 +1332,12 @@ fn parse_override(raw: &str) -> Result<(String, String)> {
 fn load_collection(path: &Path) -> Result<Collection> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read collection: {}", path.display()))?;
-    parse_collection(&content)
+    let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    parse_collection_at(&content, base_dir)
 }
 
 fn usage() -> &'static str {
-    "usage:\n  php-http collection list <collection.json>\n  php-http collection env <collection.json> --env <environment.json> [--var key=value]...\n  php-http collection run <collection.json> --request <name|id> [--env <environment.json>] [--var key=value]... [--json] [--follow]\n  php-http collection run <collection.json> --all [--env <environment.json>] [--var key=value]... [--json] [--fail-fast] [--follow]"
+    "usage:\n  php-http collection list <collection.json>\n  php-http collection env <collection.json> --env <environment.json> [--var key=value]...\n  php-http collection run <collection.json> --request <name|id> [--env <environment.json>] [--var key=value]... [--json] [--follow] [--history <file>]\n  php-http collection run <collection.json> --all [--env <environment.json>] [--var key=value]... [--json] [--fail-fast] [--follow] [--history <file>]"
 }
 
 #[cfg(test)]
@@ -1169,7 +1350,7 @@ mod tests {
     fn parses_nested_folders_and_requests() {
         let collection = parse_collection(FIXTURE).expect("fixture parses");
         assert_eq!(collection.name, "Demo API");
-        assert_eq!(collection.requests.len(), 3);
+        assert_eq!(collection.requests.len(), 6);
 
         let get = collection
             .requests
@@ -1192,7 +1373,10 @@ mod tests {
             .find(|r| r.id == "req-post-items")
             .expect("POST items");
         assert_eq!(post.method, "POST");
-        assert_eq!(post.body.as_deref(), Some("{\"name\":\"demo\"}"));
+        assert_eq!(
+            post.body,
+            Some(Body::Raw("{\"name\":\"demo\"}".to_string()))
+        );
         assert_eq!(post.auth, Some(Auth::Bearer("{{token}}".to_string())));
         assert!(post
             .headers
@@ -1314,9 +1498,101 @@ mod tests {
             auth: Some(auth),
             folder_vars: Vec::new(),
             request_vars: Vec::new(),
+            base_dir: PathBuf::from("."),
         };
         let (headers, _) = apply_auth(&request, &HashMap::new());
         assert_eq!(headers, vec![("Authorization".to_string(), "Basic dXNlcjpwYXNz".to_string())]);
+    }
+
+    #[test]
+    fn parses_raw_urlencoded_formdata_and_graphql_bodies() {
+        let collection = parse_collection(FIXTURE).expect("fixture parses");
+
+        let urlencoded = collection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-urlencoded")
+            .expect("urlencoded request");
+        assert_eq!(
+            urlencoded.body,
+            Some(Body::UrlEncoded(vec![
+                ("full name".to_string(), "Ada Lovelace".to_string()),
+                ("note".to_string(), "a+b & c=d".to_string()),
+            ]))
+        );
+        assert!(urlencoded.headers.iter().any(|(k, v)| {
+            k == "Content-Type" && v == "application/x-www-form-urlencoded"
+        }));
+        assert_eq!(
+            urlencoded.auth,
+            Some(Auth::Bearer("{{token}}".to_string()))
+        );
+
+        let formdata = collection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-formdata")
+            .expect("formdata request");
+        assert_eq!(
+            formdata.body,
+            Some(Body::FormData(vec![
+                FormField {
+                    key: "title".to_string(),
+                    value: "hello".to_string(),
+                    is_file: false,
+                },
+                FormField {
+                    key: "full name".to_string(),
+                    value: "Ada Lovelace".to_string(),
+                    is_file: false,
+                },
+                FormField {
+                    key: "upload".to_string(),
+                    value: "upload.txt".to_string(),
+                    is_file: true,
+                },
+            ]))
+        );
+        assert!(!formdata
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type")));
+
+        let graphql = collection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-graphql")
+            .expect("graphql request");
+        assert_eq!(
+            graphql.body,
+            Some(Body::GraphQL {
+                query: "query($id: Int!) { item(id: $id) { name } }".to_string(),
+                variables: "{\"id\": 7}".to_string(),
+            })
+        );
+        assert!(graphql
+            .headers
+            .iter()
+            .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn rejects_unknown_body_mode() {
+        let err = parse_collection(
+            r#"{
+                "info": {"name": "bodies"},
+                "item": [{
+                    "name": "binary",
+                    "request": {
+                        "method": "POST",
+                        "url": "http://example.test",
+                        "body": {"mode": "binary", "file": {"src": "x"}}
+                    }
+                }]
+            }"#,
+        )
+        .expect_err("unknown mode fails");
+        assert!(err.to_string().contains("unsupported Postman body mode: binary"));
     }
 
     #[test]
