@@ -46,3 +46,15 @@ Vendor остаётся на внешнем диске (места там мно
 - `cargo build -p zed` — зелёная;
 - запуск на `fixtures/workbench` — вкладки Files/Remote/Databases/HTTP/
   Collections, Remote-дерево, PHP LSP (phpantom + php-lint).
+
+
+## Важные грабли
+
+1. **«Move Zed to Applications?»** — dev-бинарь предлагает «установиться» и
+   копирует весь `target/debug` (десятки ГБ) в `/Applications/debug`.
+   В форке этот промпт отключён в `crates/zed/src/main.rs`
+   (закомментирован `move_to_applications::init`). Не соглашайтесь на него.
+2. **Зависание в `_dyld_start`** после пересборки: процесс с RSS ~32 КБ и без
+   окна. Лечится повторной ad-hoc подписью:
+   `codesign --force --sign - vendor/zed/target/debug/zed` и повторным запуском.
+3. `target/debug/incremental` удалять после сборки — экономит ~10 ГБ.
