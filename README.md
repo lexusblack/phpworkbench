@@ -112,3 +112,16 @@ open -n dist/PhpWorkbench.app --args --user-data-dir ~/.phpworkbench
 Собственные файлы этого репозитория — MIT. Форк Zed наследует GPL-3.0-or-later:
 распространение бинарника требует публикации полного исходного кода.
 Имя, иконки и тема — собственные, без марки Zed и JetBrains.
+
+
+## Диск и бэкапы
+
+`vendor` — симлинк на `/Volumes/QUICK/vendor` (исходники и `target/` на внешнем
+диске). После каждого изменения форка:
+
+```bash
+./scripts/backup-vendor.sh
+```
+
+Bundle и копия `php_panel` кладутся в `backups/` и `recovery/` на внутреннем
+диске. История потери и восстановления — `docs/RECOVERY.md`.

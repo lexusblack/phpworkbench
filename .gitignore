@@ -13,3 +13,4 @@ fixtures/frameworks/node_modules/
 dist/
 extensions/php-lint/target/
 extensions/php-lint/extension.wasm
+backups/
