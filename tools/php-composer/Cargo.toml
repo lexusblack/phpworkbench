@@ -1,0 +1,18 @@
+[package]
+name = "php-composer"
+version = "0.1.0"
+edition = "2021"
+description = "Composer bridge for the IDE"
+
+[[bin]]
+name = "php-composer"
+path = "src/main.rs"
+
+[lib]
+name = "php_composer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

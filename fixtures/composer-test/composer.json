@@ -1,0 +1,17 @@
+{
+  "name": "fixture/composer-test",
+  "description": "Fixture for tools/php-composer",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.1",
+    "guzzlehttp/guzzle": "^7",
+    "psr/log": "^3"
+  },
+  "scripts": {
+    "test": "@php -r \"echo \\\"ok\\n\\\";\""
+  },
+  "config": {
+    "sort-packages": true
+  }
+}
