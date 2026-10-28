@@ -4,7 +4,34 @@
     "bindings": {
       "cmd-shift-t": "workspace::NewTerminal",
       "ctrl-shift-`": "terminal_panel::ToggleFocus",
-      "cmd-alt-p": "php_panel::ToggleFocus"
+      "cmd-alt-p": "php_panel::ToggleFocus",
+      "cmd-shift-o": "file_finder::Toggle",
+      "cmd-o": "project_symbols::Toggle",
+      "cmd-alt-o": "project_symbols::Toggle",
+      "cmd-shift-f": "pane::DeploySearch",
+      "ctrl-tab": "tab_switcher::Toggle",
+      "cmd-1": "project_panel::ToggleFocus",
+      "cmd-6": "php_panel::ToggleFocus",
+      "ctrl-alt-tab": "php_panel::SelectNextTab",
+      "ctrl-alt-shift-tab": "php_panel::SelectPrevTab"
+    }
+  },
+  {
+    "context": "Editor",
+    "bindings": {
+      "cmd-b": "editor::GoToDefinition",
+      "cmd-alt-b": "editor::GoToTypeDefinition",
+      "alt-f7": "editor::FindAllReferences",
+      "alt-enter": "editor::ToggleCodeActions",
+      "shift-f6": "editor::Rename",
+      "ctrl-alt-l": "editor::Format"
+    }
+  },
+  {
+    "context": "Pane",
+    "bindings": {
+      "cmd-b": "editor::GoToDefinition",
+      "alt-enter": "editor::ToggleCodeActions"
     }
   }
 ]

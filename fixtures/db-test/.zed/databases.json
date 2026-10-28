@@ -10,6 +10,11 @@
       "driver": "postgres",
       "url": "postgres://app@localhost:5432/app",
       "password_env": "PGPASSWORD"
+    },
+    {
+      "name": "demo2",
+      "driver": "sqlite",
+      "path": "demo.sqlite"
     }
   ]
 }
