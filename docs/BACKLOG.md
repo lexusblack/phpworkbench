@@ -31,6 +31,7 @@
 - [~] Аудит зависимостей (`deps-audit`) + LSP-подсветка
 - [x] Деплой: Tools-меню (Deployment Configuration.../Browse Remote Host), диалог отдельным окном (список+/-. tabs Connection/Mappings/Excluded, Test Connection, OK/Cancel), дропдаун сервера в панели, сервер в статус-баре окна (<no default server>), персист active — e2e проверено
 - [x] Панель Remote: picker+дропдаун, root-строка, дерево, Refresh/Sync — e2e проверено
+- [x] Data Sources and Drivers: диалог-окно (General/Options/SSH-SSL/Schemas/Advanced, +/−/copy, Problems, Test Connection через temp-config), php-db 0.2.0: ssh-туннель (реальный ssh -N -L), read_only (блок write-запросов), url override, options + --verbose-dsn; окно из Tools и из + меню с драйверами; редактирование реально работает — e2e (туннель действительно выполняется, refused insert)
 - [x] Панель Databases: подключения, схема, грид данных и SQL-консоль (чтение)
 - [x] Панель HTTP: список запросов, запуск через php-http, статус ответа
 - [~] Composer: движок php-composer (list/outdated/validate/scripts/require/remove); UI-панели нет
