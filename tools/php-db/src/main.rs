@@ -39,9 +39,14 @@ Connection extensions:
   makes `query` refuse write statements (insert/update/delete/drop/alter/
   truncate/create/grant/revoke) with exit code 2 and blocks `exec` entirely;
   --allow-write does NOT bypass it, and sqlite databases are opened with the
-  -readonly flag. `ssh_tunnel: {enabled, host, port, user, local_port?}` opens
-  a temporary `ssh -N -L` process (key-based auth only) for postgres, mysql,
-  and mariadb; it is terminated when the command ends. `options` is a driver
+  -readonly flag. `ssh_tunnel: {enabled, host, port, user, local_port?,
+  auth?, password?, key_path?, strict_host_key?, keep_alive?}` opens a
+  temporary `ssh -N -L` process for postgres, mysql, and mariadb; it is
+  terminated when the command ends. `auth` is `agent` (default, BatchMode),
+  `key` (`-i key_path`), or `password` (`sshpass -p`, requires the sshpass
+  binary). By default host keys are accepted on first use
+  (`strict_host_key: true` restores ssh's strict default) and `keep_alive`
+  (seconds, default 15) sets ServerAliveInterval. `options` is a driver
   map merged into the client invocation (mysql/mariadb: charset, sslmode,
   connect_timeout; postgres: sslmode, connect_timeout, application_name as
   conninfo parameters; unknown keys are kept but ignored). `--verbose-dsn

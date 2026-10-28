@@ -4,7 +4,7 @@
 
 use crate::config::{
     add_query_param, percent_decode, strip_url_credentials, strip_url_password, Connection, Driver,
-    SshTunnel,
+    SshAuth, SshTunnel,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
@@ -202,15 +202,73 @@ pub fn pick_free_port() -> Result<u16> {
     Ok(port)
 }
 
-/// The exact `ssh` argv. Deliberately argv-form (no shell interpolation) with
-/// `BatchMode=yes` so a missing key fails fast instead of hanging on a prompt.
+/// Removes a secret from user-visible error text. An empty secret is a no-op
+/// so call sites never need to special-case it.
+pub fn scrub(text: &str, secret: Option<&str>) -> String {
+    match secret {
+        Some(secret) if !secret.is_empty() => text.replace(secret, "***"),
+        _ => text.to_string(),
+    }
+}
+
+/// The exact `ssh` argv, auth-aware. Deliberately argv-form (no shell
+/// interpolation). Modes:
+///
+/// - `agent` (default): `-o BatchMode=yes` so a missing key fails fast
+///   instead of hanging on a prompt.
+/// - `key`: `-i <key_path> -o BatchMode=yes -o IdentitiesOnly=yes`.
+/// - `password`: the program becomes `sshpass -p <password> ssh ...` with
+///   `-o PreferredAuthentications=password -o NumberOfPasswordPrompts=1`
+///   (no BatchMode — it would suppress the prompt sshpass feeds). Requires
+///   `sshpass` on PATH; otherwise the guidance error below is returned.
+///
+/// Host-key policy: `strict_host_key: false` (the default) adds
+/// `-o StrictHostKeyChecking=accept-new`; `true` leaves ssh's own default.
+/// `keep_alive` seconds become `-o ServerAliveInterval=<n>`.
 pub fn ssh_tunnel_command(
     tunnel: &SshTunnel,
     db_host: &str,
     db_port: u16,
     local_port: u16,
-) -> Command {
-    let mut command = Command::new("ssh");
+) -> Result<Command> {
+    ssh_tunnel_command_with(tunnel, db_host, db_port, local_port, None)
+}
+
+/// Like `ssh_tunnel_command` but with an explicit `PATH` for the `sshpass`
+/// lookup, so tests stay hermetic.
+pub fn ssh_tunnel_command_with(
+    tunnel: &SshTunnel,
+    db_host: &str,
+    db_port: u16,
+    local_port: u16,
+    search_path: Option<&OsStr>,
+) -> Result<Command> {
+    let password = match tunnel.auth {
+        SshAuth::Password => {
+            let password = tunnel
+                .password
+                .as_deref()
+                .filter(|password| !password.is_empty())
+                .context("ssh_tunnel.auth=password requires a non-empty `password`")?;
+            if find_executable("sshpass", search_path).is_none() {
+                bail!("sshpass not installed — use key or agent authentication");
+            }
+            Some(password.to_string())
+        }
+        SshAuth::Key if tunnel.key_path.as_deref().is_none_or(str::is_empty) => {
+            bail!("ssh_tunnel.auth=key requires a non-empty `key_path`");
+        }
+        _ => None,
+    };
+
+    let mut command = match &password {
+        Some(password) => {
+            let mut command = Command::new("sshpass");
+            command.arg("-p").arg(password).arg("ssh");
+            command
+        }
+        None => Command::new("ssh"),
+    };
     command
         .arg("-N")
         .arg("-L")
@@ -218,34 +276,62 @@ pub fn ssh_tunnel_command(
         .arg(format!("{}@{}", tunnel.user, tunnel.host))
         .arg("-p")
         .arg(tunnel.port.to_string());
-    if let Some(identity_file) = &tunnel.identity_file {
+    // Key material: the explicit `key_path` in key mode, otherwise the legacy
+    // `identity_file` hint (agent mode).
+    let identity_file = match tunnel.auth {
+        SshAuth::Key => tunnel.key_path.as_deref(),
+        _ => tunnel.identity_file.as_deref(),
+    };
+    if let Some(identity_file) = identity_file {
         command.arg("-i").arg(identity_file);
+    }
+    if !tunnel.strict_host_key {
+        command.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    }
+    match tunnel.auth {
+        SshAuth::Agent => {
+            command.arg("-o").arg("BatchMode=yes");
+        }
+        SshAuth::Key => {
+            command.arg("-o").arg("BatchMode=yes");
+            command.arg("-o").arg("IdentitiesOnly=yes");
+        }
+        SshAuth::Password => {
+            command.arg("-o").arg("PreferredAuthentications=password");
+            command.arg("-o").arg("NumberOfPasswordPrompts=1");
+        }
     }
     command
         .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
         .arg("ConnectTimeout=5")
         .arg("-o")
-        .arg("ServerAliveInterval=15");
-    command
+        .arg(format!("ServerAliveInterval={}", tunnel.keep_alive));
+    Ok(command)
 }
 
 /// Spawns the tunnel and polls `127.0.0.1:<local_port>` every 200 ms for up to
 /// 10 s. On success returns the ssh child (kept alive by the session); on any
 /// failure the child is killed and `ssh tunnel failed: <stderr tail>` is
-/// returned — the caller never falls through to a direct connection.
+/// returned — the caller never falls through to a direct connection. The
+/// tunnel password (password mode) is scrubbed from every error message.
 fn establish_tunnel(
     tunnel: &SshTunnel,
     db_host: &str,
     db_port: u16,
     local_port: u16,
 ) -> Result<Child> {
+    let secret = match tunnel.auth {
+        SshAuth::Password => tunnel.password.as_deref(),
+        _ => None,
+    };
     let mut child = ssh_tunnel_command(tunnel, db_host, db_port, local_port)
+        .map_err(|error| anyhow::anyhow!("{}", scrub(&error.to_string(), secret)))?
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| anyhow::anyhow!("ssh tunnel failed: {error}"))?;
+        .map_err(|error| {
+            anyhow::anyhow!("{}", scrub(&format!("ssh tunnel failed: {error}"), secret))
+        })?;
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let address: SocketAddr = format!("127.0.0.1:{local_port}")
@@ -259,7 +345,10 @@ fn establish_tunnel(
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("ssh tunnel failed: {error}");
+                bail!(
+                    "{}",
+                    scrub(&format!("ssh tunnel failed: {error}"), secret)
+                );
             }
         }
         if TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_ok() {
@@ -273,7 +362,7 @@ fn establish_tunnel(
         let _ = child.kill();
         let _ = child.wait();
         let tail = stderr_tail(&mut child).unwrap_or_default();
-        bail!("ssh tunnel failed: {tail}");
+        bail!("{}", scrub(&format!("ssh tunnel failed: {tail}"), secret));
     }
     Ok(child)
 }
@@ -2410,7 +2499,7 @@ mod tests {
                 "identity_file":"~/.ssh/id_ed25519","local_port":15432}"#,
         )
         .unwrap();
-        let command = ssh_tunnel_command(&tunnel, "db.internal", 5432, 15432);
+        let command = ssh_tunnel_command(&tunnel, "db.internal", 5432, 15432).unwrap();
         assert_eq!(command.get_program(), OsStr::new("ssh"));
         assert_eq!(
             args(&command),
@@ -2424,6 +2513,8 @@ mod tests {
                 "-i".to_string(),
                 "~/.ssh/id_ed25519".to_string(),
                 "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+                "-o".to_string(),
                 "BatchMode=yes".to_string(),
                 "-o".to_string(),
                 "ConnectTimeout=5".to_string(),
@@ -2431,6 +2522,174 @@ mod tests {
                 "ServerAliveInterval=15".to_string(),
             ]
         );
+    }
+
+    /// A hermetic directory holding an executable dummy `sshpass` so the
+    /// password-mode argv tests do not depend on a real installation.
+    fn fake_sshpass_dir() -> PathBuf {
+        let dir = tempfile_dir().join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("sshpass");
+        if !fake.exists() {
+            std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        dir
+    }
+
+    #[test]
+    fn ssh_tunnel_agent_mode_is_default_argv() {
+        let tunnel: SshTunnel = serde_json::from_str(
+            r#"{"enabled":true,"host":"bastion.example.com","user":"deploy"}"#,
+        )
+        .unwrap();
+        let command = ssh_tunnel_command(&tunnel, "db.internal", 5432, 4242).unwrap();
+        assert_eq!(command.get_program(), OsStr::new("ssh"));
+        assert_eq!(
+            args(&command),
+            vec![
+                "-N".to_string(),
+                "-L".to_string(),
+                "127.0.0.1:4242:db.internal:5432".to_string(),
+                "deploy@bastion.example.com".to_string(),
+                "-p".to_string(),
+                "22".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                "ConnectTimeout=5".to_string(),
+                "-o".to_string(),
+                "ServerAliveInterval=15".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_tunnel_key_mode_argv() {
+        let tunnel: SshTunnel = serde_json::from_str(
+            r#"{"enabled":true,"host":"bastion.example.com","user":"deploy",
+                "auth":"key","key_path":"/home/deploy/.ssh/id_rsa",
+                "strict_host_key":true,"keep_alive":30}"#,
+        )
+        .unwrap();
+        let command = ssh_tunnel_command(&tunnel, "db.internal", 5432, 4242).unwrap();
+        assert_eq!(command.get_program(), OsStr::new("ssh"));
+        assert_eq!(
+            args(&command),
+            vec![
+                "-N".to_string(),
+                "-L".to_string(),
+                "127.0.0.1:4242:db.internal:5432".to_string(),
+                "deploy@bastion.example.com".to_string(),
+                "-p".to_string(),
+                "22".to_string(),
+                "-i".to_string(),
+                "/home/deploy/.ssh/id_rsa".to_string(),
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "-o".to_string(),
+                "ConnectTimeout=5".to_string(),
+                "-o".to_string(),
+                "ServerAliveInterval=30".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_tunnel_password_mode_argv_prefixes_sshpass() {
+        let tunnel: SshTunnel = serde_json::from_str(
+            r#"{"enabled":true,"host":"bastion.example.com","user":"deploy",
+                "auth":"password","password":"s3cret","keep_alive":45}"#,
+        )
+        .unwrap();
+        let path = fake_sshpass_dir();
+        let command = ssh_tunnel_command_with(
+            &tunnel,
+            "db.internal",
+            5432,
+            4242,
+            Some(path.as_os_str()),
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), OsStr::new("sshpass"));
+        assert_eq!(
+            args(&command),
+            vec![
+                "-p".to_string(),
+                "s3cret".to_string(),
+                "ssh".to_string(),
+                "-N".to_string(),
+                "-L".to_string(),
+                "127.0.0.1:4242:db.internal:5432".to_string(),
+                "deploy@bastion.example.com".to_string(),
+                "-p".to_string(),
+                "22".to_string(),
+                "-o".to_string(),
+                "StrictHostKeyChecking=accept-new".to_string(),
+                "-o".to_string(),
+                "PreferredAuthentications=password".to_string(),
+                "-o".to_string(),
+                "NumberOfPasswordPrompts=1".to_string(),
+                "-o".to_string(),
+                "ConnectTimeout=5".to_string(),
+                "-o".to_string(),
+                "ServerAliveInterval=45".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_tunnel_password_mode_without_sshpass_gives_guidance() {
+        let tunnel: SshTunnel = serde_json::from_str(
+            r#"{"enabled":true,"host":"bastion.example.com","user":"deploy",
+                "auth":"password","password":"s3cret"}"#,
+        )
+        .unwrap();
+        let error = ssh_tunnel_command_with(
+            &tunnel,
+            "db.internal",
+            5432,
+            4242,
+            Some(OsStr::new("/nonexistent-php-db-path")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "sshpass not installed — use key or agent authentication"
+        );
+    }
+
+    #[test]
+    fn ssh_tunnel_key_mode_requires_key_path() {
+        let tunnel: SshTunnel = serde_json::from_str(
+            r#"{"enabled":true,"host":"bastion.example.com","user":"deploy","auth":"key"}"#,
+        )
+        .unwrap();
+        let error = ssh_tunnel_command(&tunnel, "db.internal", 5432, 4242)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("auth=key requires a non-empty `key_path`"));
+    }
+
+    #[test]
+    fn scrub_removes_password_from_error_text() {
+        assert_eq!(
+            scrub("sshpass -p s3cret failed: bad", Some("s3cret")),
+            "sshpass -p *** failed: bad"
+        );
+        // Multiple occurrences, and the empty-secret no-op.
+        assert_eq!(scrub("s3cret/s3cret", Some("s3cret")), "***/***");
+        assert_eq!(scrub("untouched", None), "untouched");
+        assert_eq!(scrub("untouched", Some("")), "untouched");
     }
 
     #[test]

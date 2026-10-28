@@ -5,8 +5,9 @@
       "name": "local",
       "protocol": "local",
       "remote_root": "remote",
-      "local_root": ".",
-      "exclude": []
+      "local_root": "/Users/admin/phpstorm/fixtures/deploy-test",
+      "exclude": [],
+      "visible": true
     },
     {
       "name": "sftp",
@@ -16,7 +17,8 @@
       "user": "deploy",
       "remote_root": "/var/www/app",
       "local_root": ".",
-      "exclude": []
+      "exclude": [],
+      "visible": true
     },
     {
       "name": "web1",
@@ -25,8 +27,10 @@
       "port": 2222,
       "user": "deploy",
       "remote_root": "webroot",
-      "exclude": []
+      "exclude": [],
+      "use_rsync": true,
+      "visible": true
     }
   ],
-  "active": "sftp"
+  "active": "web1"
 }

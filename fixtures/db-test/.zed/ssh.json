@@ -1,0 +1,14 @@
+{
+  "configs": [
+    {
+      "name": "local-ssh",
+      "user": "admin",
+      "host": "127.0.0.1",
+      "port": 22,
+      "auth": "password",
+      "password": "secret",
+      "keep_alive": 15,
+      "strict_host_key": false
+    }
+  ]
+}

@@ -100,10 +100,45 @@ pub struct ConfigFile {
     pub connections: Vec<Connection>,
 }
 
+/// Authentication mode for the ssh tunnel. `agent` (the default) relies on
+/// `BatchMode=yes` and whatever the local ssh agent offers; `key` pins an
+/// explicit identity file; `password` drives the interactive prompt through
+/// `sshpass` (which must be installed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshAuth {
+    #[default]
+    Agent,
+    Password,
+    Key,
+}
+
+impl SshAuth {
+    pub fn parse(value: &str) -> Option<SshAuth> {
+        Some(match value {
+            "agent" => SshAuth::Agent,
+            "password" => SshAuth::Password,
+            "key" => SshAuth::Key,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SshAuth::Agent => "agent",
+            SshAuth::Password => "password",
+            SshAuth::Key => "key",
+        }
+    }
+}
+
 /// SSH tunnel description. When `enabled` is true, every command opens a
 /// temporary `ssh -N -L` process and reaches the database through
 /// `127.0.0.1:<local_port>`; the process is terminated when the command ends.
-/// Only key-based / agent authentication works (`BatchMode=yes`).
+/// Auth modes (`auth`): `agent` (default, `BatchMode=yes`), `key`
+/// (`-i key_path -o IdentitiesOnly=yes`), `password` (`sshpass -p`, requires
+/// the `sshpass` binary). `strict_host_key: true` restores ssh's default host
+/// key checking; the default `false` uses `accept-new`. `keep_alive` (seconds,
+/// default 15) becomes `ServerAliveInterval`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshTunnel {
@@ -117,10 +152,36 @@ pub struct SshTunnel {
     pub identity_file: Option<String>,
     #[serde(default)]
     pub local_port: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_ssh_auth")]
+    pub auth: SshAuth,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub key_path: Option<String>,
+    #[serde(default)]
+    pub strict_host_key: bool,
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: u64,
 }
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_keep_alive() -> u64 {
+    15
+}
+
+fn deserialize_ssh_auth<'de, D>(deserializer: D) -> Result<SshAuth, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    SshAuth::parse(&value).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "invalid ssh auth mode `{value}` (expected agent, password, or key)"
+        ))
+    })
 }
 
 impl SshTunnel {
@@ -139,6 +200,16 @@ impl SshTunnel {
         }
         if self.local_port == Some(0) {
             bail!("connection `{connection}` has an ssh_tunnel with local_port 0");
+        }
+        if self.auth == SshAuth::Password && self.password.as_deref().is_none_or(str::is_empty) {
+            bail!(
+                "connection `{connection}` has ssh_tunnel auth=password but no non-empty `password`"
+            );
+        }
+        if self.auth == SshAuth::Key && self.key_path.as_deref().is_none_or(str::is_empty) {
+            bail!(
+                "connection `{connection}` has ssh_tunnel auth=key but no non-empty `key_path`"
+            );
         }
         Ok(())
     }
@@ -894,11 +965,79 @@ mod tests {
     fn rejects_unknown_ssh_tunnel_field() {
         let error = parse(
             r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
-                "ssh_tunnel":{"host":"b","user":"u","password":"nope"}}]}"#,
+                "ssh_tunnel":{"host":"b","user":"u","bogus_option":"nope"}}]}"#,
         )
         .unwrap_err()
         .to_string();
         assert!(error.contains("unknown field"));
+    }
+
+    #[test]
+    fn ssh_tunnel_auth_fields_parse_with_defaults() {
+        // Old configs without the new fields keep working (agent defaults).
+        let connections = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u"}}]}"#,
+        )
+        .unwrap();
+        let tunnel = connections[0].ssh_tunnel.as_ref().unwrap();
+        assert_eq!(tunnel.auth, SshAuth::Agent);
+        assert_eq!(tunnel.password, None);
+        assert_eq!(tunnel.key_path, None);
+        assert!(!tunnel.strict_host_key);
+        assert_eq!(tunnel.keep_alive, 15);
+
+        let connections = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u",
+                    "auth":"password","password":"s3cret",
+                    "strict_host_key":true,"keep_alive":30}}]}"#,
+        )
+        .unwrap();
+        let tunnel = connections[0].ssh_tunnel.as_ref().unwrap();
+        assert_eq!(tunnel.auth, SshAuth::Password);
+        assert_eq!(tunnel.password.as_deref(), Some("s3cret"));
+        assert!(tunnel.strict_host_key);
+        assert_eq!(tunnel.keep_alive, 30);
+
+        let connections = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u",
+                    "auth":"key","key_path":"~/.ssh/id_ed25519"}}]}"#,
+        )
+        .unwrap();
+        let tunnel = connections[0].ssh_tunnel.as_ref().unwrap();
+        assert_eq!(tunnel.auth, SshAuth::Key);
+        assert_eq!(tunnel.key_path.as_deref(), Some("~/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn ssh_tunnel_auth_mode_and_required_fields_are_validated() {
+        let error = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u","auth":"agent2"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("invalid ssh auth mode `agent2`"));
+
+        let error = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u",
+                    "auth":"password"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("auth=password but no non-empty `password`"));
+
+        let error = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u",
+                    "auth":"key","key_path":""}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("auth=key but no non-empty `key_path`"));
     }
 
     #[test]
