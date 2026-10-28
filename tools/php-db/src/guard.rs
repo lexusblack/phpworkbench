@@ -7,12 +7,28 @@
 
 const DESTRUCTIVE: [&str; 3] = ["drop", "truncate", "delete"];
 
-/// Returns the first destructive keyword found, lower-cased.
-pub fn destructive_keyword(sql: &str) -> Option<String> {
+/// Keywords refused on `read_only` connections. Superset of DESTRUCTIVE:
+/// every data-definition or data-modifying verb counts as a write.
+const WRITES: [&str; 9] = [
+    "insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "revoke",
+];
+
+fn keyword_in(sql: &str, list: &[&str]) -> Option<String> {
     significant_words(sql)
         .into_iter()
-        .find(|word| DESTRUCTIVE.contains(&word.to_ascii_lowercase().as_str()))
+        .find(|word| list.contains(&word.to_ascii_lowercase().as_str()))
         .map(|word| word.to_ascii_lowercase())
+}
+
+/// Returns the first destructive keyword found, lower-cased.
+pub fn destructive_keyword(sql: &str) -> Option<String> {
+    keyword_in(sql, &DESTRUCTIVE)
+}
+
+/// Returns the first write keyword found, lower-cased. Used for `read_only`
+/// connections; SELECT/EXPLAIN/SHOW/PRAGMA queries find nothing here.
+pub fn write_keyword(sql: &str) -> Option<String> {
+    keyword_in(sql, &WRITES)
 }
 
 fn significant_words(sql: &str) -> Vec<String> {
@@ -98,5 +114,36 @@ mod tests {
             destructive_keyword("update t set x = 1; delete from t;").as_deref(),
             Some("delete")
         );
+    }
+
+    #[test]
+    fn write_keyword_blocks_every_write_verb() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "update t set x = 1",
+            "delete from t",
+            "drop table t",
+            "alter table t add column c int",
+            "truncate table t",
+            "create index i on t (c)",
+            "grant select on t to u",
+            "revoke select on t from u",
+        ] {
+            assert!(write_keyword(sql).is_some(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn write_keyword_allows_reads() {
+        for sql in [
+            "select * from t",
+            "explain select * from t",
+            "show tables",
+            "pragma table_info(t)",
+            "select create_counter from t",
+            "select 'insert' as word",
+        ] {
+            assert_eq!(write_keyword(sql), None, "{sql}");
+        }
     }
 }

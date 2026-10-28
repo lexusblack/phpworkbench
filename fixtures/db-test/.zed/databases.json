@@ -15,6 +15,37 @@
       "name": "demo2",
       "driver": "sqlite",
       "path": "demo.sqlite"
+    },
+    {
+      "name": "app-ro",
+      "driver": "sqlite",
+      "path": "demo.sqlite",
+      "read_only": true,
+      "options": {
+        "busy_timeout": "5000",
+        "custom_unknown": "kept-but-ignored"
+      },
+      "ssh_tunnel": {
+        "enabled": false,
+        "host": "bastion.example.com",
+        "port": 22,
+        "user": "deploy",
+        "local_port": 15432
+      }
+    },
+    {
+      "name": "pg-tunnel-dead",
+      "driver": "postgres",
+      "host": "127.0.0.1",
+      "port": 15433,
+      "user": "ci",
+      "database": "reporting",
+      "ssh_tunnel": {
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 1,
+        "user": "ci"
+      }
     }
   ]
 }

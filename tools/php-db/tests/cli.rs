@@ -172,3 +172,134 @@ fn every_missing_client_is_named() {
         assert!(error.contains(client), "{name}: {error}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// read_only, ssh tunnels, --verbose-dsn
+// ---------------------------------------------------------------------------
+
+fn temp_project(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "php-db-cli-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(dir.join(".zed")).unwrap();
+    dir
+}
+
+#[test]
+fn read_only_connection_refuses_writes_and_blocks_exec() {
+    let project = temp_project("ro");
+    let path = project.join("demo.sqlite");
+    let status = Command::new("sqlite3")
+        .arg(&path)
+        .arg("CREATE TABLE t (id INTEGER)")
+        .status()
+        .expect("sqlite3 CLI");
+    assert!(status.success());
+    let config = project.join(".zed").join("databases.json");
+    std::fs::write(
+        &config,
+        r#"{"connections":[
+        {"name":"ro","driver":"sqlite","path":"demo.sqlite","read_only":true},
+        {"name":"rw","driver":"sqlite","path":"demo.sqlite"}
+    ]}"#,
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+
+    // A write keyword is refused with exit code 2 and a read_only message,
+    // even with --allow-write.
+    let output = Command::new(binary())
+        .args(["--config", config, "query", "ro", "INSERT INTO t VALUES (1)"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is read_only"), "{:?}", String::from_utf8_lossy(&output.stderr));
+
+    let output = Command::new(binary())
+        .args([
+            "--config",
+            config,
+            "query",
+            "ro",
+            "insert into t values (1)",
+            "--allow-write",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+
+    // Reads are fine.
+    let output = Command::new(binary())
+        .args(["--config", config, "query", "ro", "SELECT 1", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // The same statement is also fine without read_only (sqlite checks only
+    // the destructive keywords here, and CREATE-free benign writes pass).
+    let output = Command::new(binary())
+        .args(["--config", config, "query", "rw", "SELECT 1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[test]
+fn tunnel_failure_is_reported_without_fallthrough() {
+    let output = Command::new(binary())
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/db-test"))
+        .args(["check", "pg-tunnel-dead"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("ssh tunnel failed"), "{error}");
+    // The dead tunnel must not fall through to a direct connection: the
+    // message is the tunnel failure itself, not a psql error.
+    assert!(!error.contains("psql failed"), "{error}");
+}
+
+#[test]
+fn verbose_dsn_prints_composed_dsn_and_ignored_options() {
+    let project = temp_project("dsn");
+    let path = project.join("demo.sqlite");
+    let status = Command::new("sqlite3")
+        .arg(&path)
+        .arg("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .status()
+        .expect("sqlite3 CLI");
+    assert!(status.success());
+    std::fs::write(
+        project.join(".zed").join("databases.json"),
+        format!(
+            r#"{{"connections":[{{"name":"app","driver":"sqlite","path":"{}","read_only":true,
+            "options":{{"unknown_for_sqlite":"x"}}}}]}}"#,
+            path.display()
+        ),
+    )
+    .unwrap();
+    let config = project.join(".zed").join("databases.json");
+    let config = config.to_str().unwrap();
+
+    let output = Command::new(binary())
+        .args(["--config", config, "--verbose-dsn", "app"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.starts_with("DSN: sqlite3:"), "{text}");
+    assert!(text.contains("?read_only=1"), "{text}");
+    assert!(text.contains("ignored-options: unknown_for_sqlite"), "{text}");
+
+    // The flag also annotates a normal run (stderr) without changing it.
+    let output = Command::new(binary())
+        .args(["--config", config, "--verbose-dsn", "query", "app", "SELECT 1"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("1"));
+    let error = stderr(&output);
+    assert!(error.contains("DSN:"), "{error}");
+}

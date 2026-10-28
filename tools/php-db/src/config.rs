@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -99,17 +100,23 @@ pub struct ConfigFile {
     pub connections: Vec<Connection>,
 }
 
-/// Optional SSH tunnel description. It is modelled in the config so projects
-/// can record how a server is reached, but `php-db` does not open tunnels yet.
+/// SSH tunnel description. When `enabled` is true, every command opens a
+/// temporary `ssh -N -L` process and reaches the database through
+/// `127.0.0.1:<local_port>`; the process is terminated when the command ends.
+/// Only key-based / agent authentication works (`BatchMode=yes`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshTunnel {
+    #[serde(default)]
+    pub enabled: bool,
     pub host: String,
     pub user: String,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
     #[serde(default)]
     pub identity_file: Option<String>,
+    #[serde(default)]
+    pub local_port: Option<u16>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -129,6 +136,9 @@ impl SshTunnel {
         }
         if self.identity_file.as_deref() == Some("") {
             bail!("connection `{connection}` has an ssh_tunnel with an empty identity_file");
+        }
+        if self.local_port == Some(0) {
+            bail!("connection `{connection}` has an ssh_tunnel with local_port 0");
         }
         Ok(())
     }
@@ -163,6 +173,18 @@ pub struct Connection {
     pub ssl: Option<bool>,
     #[serde(default)]
     pub ssh_tunnel: Option<SshTunnel>,
+    /// Refuse write statements on `query` and refuse `exec` entirely. SQLite
+    /// databases are additionally opened with the `-readonly` flag.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Driver options merged into the client invocation (string → string).
+    /// Unknown keys are kept but ignored; `--verbose-dsn` lists them.
+    #[serde(default)]
+    pub options: Option<BTreeMap<String, String>>,
+    /// Password decoded from `url` by `normalize`. Internal: it survives the
+    /// ssh-tunnel rewrite, which drops `url` in favour of host/port fields.
+    #[serde(default)]
+    pub resolved_password: Option<String>,
 }
 
 pub struct Store {
@@ -181,12 +203,13 @@ impl Store {
             .with_context(|| format!("cannot read config {}", path.display()))?;
         let file: ConfigFile = serde_json::from_str(&text)
             .with_context(|| format!("invalid JSON in {}", path.display()))?;
-        validate_all(&file.connections)?;
-        if file.connections.is_empty() {
+        let mut connections = file.connections;
+        if connections.is_empty() {
             bail!("config {} has no connections", path.display());
         }
+        validate_all(&mut connections)?;
         Ok(Store {
-            connections: file.connections,
+            connections,
             base: base_dir(&path),
             path,
         })
@@ -211,14 +234,15 @@ impl Store {
     }
 }
 
-fn validate_all(connections: &[Connection]) -> Result<()> {
-    let mut seen: Vec<&str> = Vec::with_capacity(connections.len());
-    for connection in connections {
+fn validate_all(connections: &mut [Connection]) -> Result<()> {
+    let mut seen: Vec<String> = Vec::with_capacity(connections.len());
+    for connection in connections.iter_mut() {
+        connection.normalize()?;
         connection.validate()?;
-        if seen.contains(&connection.name.as_str()) {
+        if seen.contains(&connection.name) {
             bail!("duplicate connection name `{}`", connection.name);
         }
-        seen.push(&connection.name);
+        seen.push(connection.name.clone());
     }
     Ok(())
 }
@@ -233,6 +257,50 @@ impl Connection {
                 driver_list()
             )
         })
+    }
+
+    /// Applies PhpStorm "url overrides settings above" semantics: when `url` is
+    /// present and parseable, its host/port/user/password/database replace the
+    /// individual fields. Scheme-less urls (Oracle's `user@host:port/service`)
+    /// are passed through untouched.
+    pub fn normalize(&mut self) -> Result<()> {
+        let Some(url) = self
+            .url
+            .as_deref()
+            .filter(|url| !url.is_empty() && url.contains("://"))
+        else {
+            return Ok(());
+        };
+        let Ok(driver) = self.driver() else {
+            return Ok(());
+        };
+        let allowed: &[&str] = match driver {
+            Driver::Postgres => &["postgres", "postgresql"],
+            Driver::Mysql => &["mysql"],
+            Driver::MariaDb => &["mysql", "mariadb"],
+            Driver::SqlServer => &["sqlserver", "mssql"],
+            Driver::Redis => &["redis", "rediss"],
+            // MongoDB urls may list several hosts; they are consumed verbatim
+            // by the mongosh invocation, so no field rewrite happens.
+            Driver::Mongodb | Driver::Sqlite | Driver::Oracle => return Ok(()),
+        };
+        let parsed = url_to_conn(url)
+            .with_context(|| format!("connection `{}` has an invalid url", self.name))?;
+        if !allowed.contains(&parsed.scheme.as_str()) {
+            bail!(
+                "connection `{}`: url scheme `{}` does not match driver `{}` (expected {})",
+                self.name,
+                parsed.scheme,
+                driver,
+                allowed.join(" or ")
+            );
+        }
+        self.host = Some(parsed.host);
+        self.port = parsed.port;
+        self.user = parsed.user;
+        self.database = parsed.database;
+        self.resolved_password = parsed.password;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -251,9 +319,6 @@ impl Connection {
             Driver::Sqlite => {
                 if self.path.as_deref().is_none_or(str::is_empty) {
                     bail!("sqlite connection `{}` needs a `path`", self.name);
-                }
-                if self.ssh_tunnel.is_some() {
-                    bail!("sqlite connection `{}` cannot use an ssh_tunnel", self.name);
                 }
             }
             Driver::Postgres => {
@@ -331,6 +396,17 @@ impl Connection {
 
         if let Some(tunnel) = &self.ssh_tunnel {
             tunnel.validate(&self.name)?;
+            if tunnel.enabled
+                && !matches!(
+                    driver,
+                    Driver::Postgres | Driver::Mysql | Driver::MariaDb
+                )
+            {
+                bail!(
+                    "connection `{}`: ssh_tunnel.enabled is only supported for postgres, mysql, and mariadb drivers",
+                    self.name
+                );
+            }
         }
         Ok(())
     }
@@ -349,10 +425,14 @@ impl Connection {
     }
 
     /// Reads the password from the environment variable named by `password_env`.
-    /// Without `password_env`, a password embedded in `url` is used as a fallback.
+    /// Without `password_env`, the password decoded from `url` (or embedded in
+    /// `url` when normalization was skipped) is used as a fallback.
     pub fn password(&self) -> Result<Option<String>> {
         match &self.password_env {
-            None => Ok(self.url_password()),
+            None => Ok(self
+                .resolved_password
+                .clone()
+                .or_else(|| self.url_password())),
             Some(var) => match env::var(var) {
                 Ok(value) => Ok(Some(value)),
                 Err(_) => bail!(
@@ -498,8 +578,15 @@ impl Connection {
         if self.url_password().is_some() {
             warnings.push("plaintext password in url; use password_env".to_string());
         }
-        if self.ssh_tunnel.is_some() {
-            warnings.push("ssh_tunnel is configured but not active yet".to_string());
+        if let Some(tunnel) = &self.ssh_tunnel {
+            if tunnel.enabled {
+                warnings.push(format!(
+                    "ssh_tunnel enabled: commands connect through {}@{}:{}",
+                    tunnel.user, tunnel.host, tunnel.port
+                ));
+            } else {
+                warnings.push("ssh_tunnel is configured but not active yet".to_string());
+            }
         }
         warnings
     }
@@ -625,6 +712,95 @@ pub fn add_query_param(url: &str, key: &str, value: &str) -> String {
     result
 }
 
+/// One URL parsed into connection-shaped fields. Pure: no I/O, no driver
+/// lookup — callers decide which schemes are acceptable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedConn {
+    pub scheme: String,
+    pub host: String,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub database: Option<String>,
+    pub params: Vec<(String, String)>,
+}
+
+/// Parses `scheme://[user[:password]@]host[:port][/database][?params][#frag]`
+/// into `ParsedConn`. IPv6 hosts in brackets, percent-escaped userinfo, and
+/// query parameters are handled. An empty user (`redis://:pw@host`) becomes
+/// `user: None` so password-only urls keep working.
+pub fn url_to_conn(url: &str) -> Result<ParsedConn> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .with_context(|| format!("url must include a scheme: {url}"))?;
+    if scheme.is_empty() {
+        bail!("url has an empty scheme: {url}");
+    }
+    let (authority, tail) = match rest.split_once('/') {
+        Some((authority, tail)) => (authority, Some(tail)),
+        None => (rest, None),
+    };
+    let database = tail
+        .and_then(|tail| tail.split(['?', '#']).next())
+        .filter(|database| !database.is_empty())
+        .map(str::to_string);
+    let query = tail
+        .and_then(|tail| tail.split_once('?').map(|(_, query)| query))
+        .map(|query| query.split('#').next().unwrap_or(query))
+        .unwrap_or("");
+    let mut params = Vec::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        params.push((percent_decode(key), percent_decode(value)));
+    }
+
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    let (user, password) = match userinfo {
+        Some(userinfo) => match userinfo.split_once(':') {
+            Some((user, password)) => (Some(percent_decode(user)), Some(percent_decode(password))),
+            None => (Some(percent_decode(userinfo)), None),
+        },
+        None => (None, None),
+    };
+    let user = user.filter(|user| !user.is_empty());
+    let (host, port) = split_authority(host_port)?;
+    if host.is_empty() {
+        bail!("url is missing a host");
+    }
+    Ok(ParsedConn {
+        scheme: scheme.to_string(),
+        host,
+        port,
+        user,
+        password,
+        database,
+        params,
+    })
+}
+
+fn split_authority(value: &str) -> Result<(String, Option<u16>)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, tail) = rest
+            .split_once(']')
+            .context("url has an unterminated IPv6 host")?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) => Some(port.parse().context("url has an invalid port")?),
+            None => None,
+        };
+        return Ok((host.to_string(), port));
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) => Ok((
+            host.to_string(),
+            Some(port.parse().context("url has an invalid port")?),
+        )),
+        None => Ok((value.to_string(), None)),
+    }
+}
+
 pub fn percent_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -657,8 +833,8 @@ mod tests {
     use super::*;
 
     fn parse(json: &str) -> Result<Vec<Connection>> {
-        let file: ConfigFile = serde_json::from_str(json)?;
-        validate_all(&file.connections)?;
+        let mut file: ConfigFile = serde_json::from_str(json)?;
+        validate_all(&mut file.connections)?;
         Ok(file.connections)
     }
 
@@ -846,6 +1022,9 @@ mod tests {
             sslmode: None,
             ssl: None,
             ssh_tunnel: None,
+            read_only: false,
+            options: None,
+            resolved_password: None,
         };
         let error = connection.password().unwrap_err().to_string();
         assert!(error.contains("PHP_DB_TEST_UNSET_VAR"));
@@ -866,5 +1045,153 @@ mod tests {
         assert_eq!(percent_decode("p%40ss%20word"), "p@ss word");
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode("100%"), "100%");
+    }
+
+    #[test]
+    fn url_to_conn_parses_mysql_url() {
+        let parsed = url_to_conn("mysql://news:pw@localhost:3306/newsystem").unwrap();
+        assert_eq!(parsed.scheme, "mysql");
+        assert_eq!(parsed.host, "localhost");
+        assert_eq!(parsed.port, Some(3306));
+        assert_eq!(parsed.user.as_deref(), Some("news"));
+        assert_eq!(parsed.password.as_deref(), Some("pw"));
+        assert_eq!(parsed.database.as_deref(), Some("newsystem"));
+        assert!(parsed.params.is_empty());
+    }
+
+    #[test]
+    fn url_to_conn_parses_postgres_url_with_params() {
+        let parsed = url_to_conn("postgres://u@h:5432/db?sslmode=require").unwrap();
+        assert_eq!(parsed.scheme, "postgres");
+        assert_eq!(parsed.host, "h");
+        assert_eq!(parsed.port, Some(5432));
+        assert_eq!(parsed.user.as_deref(), Some("u"));
+        assert_eq!(parsed.password, None);
+        assert_eq!(parsed.database.as_deref(), Some("db"));
+        assert_eq!(
+            parsed.params,
+            vec![("sslmode".to_string(), "require".to_string())]
+        );
+    }
+
+    #[test]
+    fn url_to_conn_rejects_invalid_urls() {
+        assert!(url_to_conn("host:5432/db").is_err());
+        assert!(url_to_conn("mysql://h:notaport/db").is_err());
+        assert!(url_to_conn("mysql:///db").is_err());
+        let parsed = url_to_conn("mysql://h/db").unwrap();
+        assert_eq!(parsed.port, None);
+    }
+
+    #[test]
+    fn url_to_conn_handles_ipv6_and_empty_user() {
+        let parsed = url_to_conn("mysql://u:p@[::1]:3306/db").unwrap();
+        assert_eq!(parsed.host, "::1");
+        assert_eq!(parsed.port, Some(3306));
+        let parsed = url_to_conn("redis://:secret@localhost:6379").unwrap();
+        assert_eq!(parsed.user, None);
+        assert_eq!(parsed.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn url_overrides_individual_fields_at_load() {
+        let connections = parse(
+            r#"{"connections":[{"name":"my","driver":"mysql",
+                "host":"wrong","port":1,"user":"wrong","database":"wrong",
+                "url":"mysql://news:pw@localhost:3306/newsystem"}]}"#,
+        )
+        .unwrap();
+        let my = &connections[0];
+        assert_eq!(my.host.as_deref(), Some("localhost"));
+        assert_eq!(my.port, Some(3306));
+        assert_eq!(my.user.as_deref(), Some("news"));
+        assert_eq!(my.database.as_deref(), Some("newsystem"));
+        assert_eq!(my.url_password().as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn new_fields_parse_with_defaults() {
+        let error = parse(
+            r#"{"connections":[{"name":"ro","driver":"sqlite","path":"a.sqlite",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u","local_port":15432}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only supported for postgres, mysql, and mariadb"));
+
+        let connections = parse(
+            r#"{"connections":[{"name":"ro","driver":"sqlite","path":"a.sqlite",
+                "read_only":true,
+                "options":{"charset":"utf8mb4"},
+                "ssh_tunnel":{"enabled":false,"host":"b","user":"u","local_port":15432}}]}"#,
+        )
+        .unwrap();
+        let ro = &connections[0];
+        assert!(ro.read_only);
+        assert_eq!(
+            ro.options.as_ref().unwrap().get("charset"),
+            Some(&"utf8mb4".to_string())
+        );
+        let tunnel = ro.ssh_tunnel.as_ref().unwrap();
+        assert!(!tunnel.enabled);
+        assert_eq!(tunnel.local_port, Some(15432));
+        let plain = parse(r#"{"connections":[{"name":"x","driver":"sqlite","path":"p"}]}"#)
+            .unwrap()
+            .remove(0);
+        assert!(!plain.read_only);
+        assert!(plain.options.is_none());
+    }
+
+    #[test]
+    fn enabled_tunnel_requires_tcp_driver() {
+        let error = parse(
+            r#"{"connections":[{"name":"ms","driver":"sqlserver","host":"h","database":"d",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u"}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("only supported for postgres, mysql, and mariadb"));
+        // Disabled tunnels stay inert on any driver (metadata only).
+        assert!(parse(
+            r#"{"connections":[{"name":"ms","driver":"sqlserver","host":"h","database":"d",
+                "ssh_tunnel":{"enabled":false,"host":"b","user":"u"}}]}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn local_port_zero_is_rejected() {
+        let error = parse(
+            r#"{"connections":[{"name":"pg","driver":"postgres","host":"h",
+                "ssh_tunnel":{"enabled":true,"host":"b","user":"u","local_port":0}}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("local_port 0"));
+    }
+
+    #[test]
+    fn db_test_fixture_with_new_fields_parses() {
+        let connections = parse(include_str!(
+            "../../../fixtures/db-test/.zed/databases.json"
+        ))
+        .unwrap();
+        let ro = connections
+            .iter()
+            .find(|c| c.name == "app-ro")
+            .expect("app-ro connection");
+        assert!(ro.read_only);
+        assert!(ro.options.is_some());
+        assert!(ro.ssh_tunnel.is_some());
+    }
+
+    #[test]
+    fn scheme_mismatch_between_url_and_driver_is_rejected() {
+        let error = parse(
+            r#"{"connections":[{"name":"my","driver":"mariadb","url":"postgres://u@h/db"}]}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not match driver"));
     }
 }

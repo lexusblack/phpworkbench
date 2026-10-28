@@ -25,12 +25,27 @@ Options:
   --config PATH   use this .zed/databases.json instead of walking up from the current directory
   --json          print JSON instead of a table
   --allow-write   permit destructive statements and exec commands
+  --verbose-dsn   print the composed DSN for a connection (see below)
   -h, --help      show this help
   -V, --version   show the version
 
 Destructive statements (drop, truncate, delete) are refused with exit code 2
 unless --allow-write is given. `exec` is a write-capable escape hatch and
 always requires --allow-write.
+
+Connection extensions:
+  A `url` overrides the host/port/user/password/database fields configured
+  above it (PhpStorm 'overrides settings above' semantics). `read_only: true`
+  makes `query` refuse write statements (insert/update/delete/drop/alter/
+  truncate/create/grant/revoke) with exit code 2 and blocks `exec` entirely;
+  --allow-write does NOT bypass it, and sqlite databases are opened with the
+  -readonly flag. `ssh_tunnel: {enabled, host, port, user, local_port?}` opens
+  a temporary `ssh -N -L` process (key-based auth only) for postgres, mysql,
+  and mariadb; it is terminated when the command ends. `options` is a driver
+  map merged into the client invocation (mysql/mariadb: charset, sslmode,
+  connect_timeout; postgres: sslmode, connect_timeout, application_name as
+  conninfo parameters; unknown keys are kept but ignored). `--verbose-dsn
+  <connection>` prints the composed DSN and any ignored options.
 ";
 
 #[derive(Default)]
@@ -38,6 +53,7 @@ struct Cli {
     config: Option<PathBuf>,
     json: bool,
     allow_write: bool,
+    verbose_dsn: bool,
     help: bool,
     version: bool,
     rest: Vec<String>,
@@ -84,6 +100,16 @@ fn run() -> Result<()> {
     };
     let args = &cli.rest[1..];
 
+    const COMMANDS: [&str; 8] = [
+        "list", "check", "schema", "databases", "views", "query", "exec", "help",
+    ];
+    if cli.verbose_dsn && cli.rest.len() == 1 && !COMMANDS.contains(&command) {
+        let store = Store::load(cli.config.as_deref())?;
+        let connection = store.get(command)?;
+        print_verbose_dsn(connection, &store.base);
+        return Ok(());
+    }
+
     match command {
         "list" => {
             if !args.is_empty() {
@@ -97,28 +123,28 @@ fn run() -> Result<()> {
                 bail!("usage: php-db check <connection> [--json]");
             };
             let store = Store::load(cli.config.as_deref())?;
-            cmd_check(&store, name, cli.json)
+            cmd_check(&store, name, cli.json, cli.verbose_dsn)
         }
         "schema" => {
             let [name] = args else {
                 bail!("usage: php-db schema <connection> [--json]");
             };
             let store = Store::load(cli.config.as_deref())?;
-            cmd_schema(&store, name, cli.json)
+            cmd_schema(&store, name, cli.json, cli.verbose_dsn)
         }
         "databases" => {
             let [name] = args else {
                 bail!("usage: php-db databases <connection> [--json]");
             };
             let store = Store::load(cli.config.as_deref())?;
-            cmd_databases(&store, name, cli.json)
+            cmd_databases(&store, name, cli.json, cli.verbose_dsn)
         }
         "views" => {
             let [name] = args else {
                 bail!("usage: php-db views <connection> [--json]");
             };
             let store = Store::load(cli.config.as_deref())?;
-            cmd_views(&store, name, cli.json)
+            cmd_views(&store, name, cli.json, cli.verbose_dsn)
         }
         "query" => {
             let [name, sql] = args else {
@@ -144,7 +170,19 @@ fn run() -> Result<()> {
                     .into());
                 }
             }
+            if connection.read_only {
+                if let Some(keyword) = guard::write_keyword(sql) {
+                    return Err(Refused(format!(
+                        "connection `{}` is read_only: refusing `{keyword}` statement (--allow-write does not bypass read_only)",
+                        connection.name
+                    ))
+                    .into());
+                }
+            }
 
+            if cli.verbose_dsn {
+                emit_verbose_dsn(connection, &store.base);
+            }
             let result = db::query(connection, &store.base, sql)?;
             print_query(&result, cli.json);
             Ok(())
@@ -163,6 +201,16 @@ fn run() -> Result<()> {
                 return Err(
                     Refused("refusing to run `exec` without --allow-write".to_string()).into(),
                 );
+            }
+            if connection.read_only {
+                return Err(Refused(format!(
+                    "connection `{}` is read_only: `exec` may write and is refused",
+                    connection.name
+                ))
+                .into());
+            }
+            if cli.verbose_dsn {
+                emit_verbose_dsn(connection, &store.base);
             }
             let output = db::exec(connection, command)?;
             print!("{output}");
@@ -192,6 +240,8 @@ fn parse_args(argv: Vec<String>) -> Result<Cli> {
             cli.json = true;
         } else if arg == "--allow-write" {
             cli.allow_write = true;
+        } else if arg == "--verbose-dsn" {
+            cli.verbose_dsn = true;
         } else if arg == "-h" || arg == "--help" {
             cli.help = true;
         } else if arg == "-V" || arg == "--version" {
@@ -203,6 +253,34 @@ fn parse_args(argv: Vec<String>) -> Result<Cli> {
         }
     }
     Ok(cli)
+}
+
+/// Composes the `--verbose-dsn` lines: the DSN plus the ignored driver
+/// options. Passwords can never appear: the DSN is redacted and passwords
+/// live in env vars/stdin, never in this output.
+fn dsn_lines(connection: &config::Connection, base: &PathBuf) -> Vec<String> {
+    let mut lines = Vec::new();
+    match db::describe_dsn(connection, base) {
+        Ok(dsn) => lines.push(format!("DSN: {dsn}")),
+        Err(error) => lines.push(format!("php-db: could not compose a DSN: {error:#}")),
+    }
+    match db::ignored_options(connection) {
+        ignored if ignored.is_empty() => lines.push("ignored-options: (none)".to_string()),
+        ignored => lines.push(format!("ignored-options: {}", ignored.join(", "))),
+    }
+    lines
+}
+
+fn print_verbose_dsn(connection: &config::Connection, base: &PathBuf) {
+    for line in dsn_lines(connection, base) {
+        println!("{line}");
+    }
+}
+
+fn emit_verbose_dsn(connection: &config::Connection, base: &PathBuf) {
+    for line in dsn_lines(connection, base) {
+        eprintln!("{line}");
+    }
 }
 
 fn cmd_list(store: &Store, json_output: bool) -> Result<()> {
@@ -284,8 +362,11 @@ fn cmd_list(store: &Store, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_check(store: &Store, name: &str, json_output: bool) -> Result<()> {
+fn cmd_check(store: &Store, name: &str, json_output: bool, verbose_dsn: bool) -> Result<()> {
     let connection = store.get(name)?;
+    if verbose_dsn {
+        emit_verbose_dsn(connection, &store.base);
+    }
     let driver = connection.driver()?;
     let message = db::check(connection, &store.base)?;
     if json_output {
@@ -305,8 +386,11 @@ fn cmd_check(store: &Store, name: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_schema(store: &Store, name: &str, json_output: bool) -> Result<()> {
+fn cmd_schema(store: &Store, name: &str, json_output: bool, verbose_dsn: bool) -> Result<()> {
     let connection = store.get(name)?;
+    if verbose_dsn {
+        emit_verbose_dsn(connection, &store.base);
+    }
     let schema = db::schema(connection, &store.base)?;
 
     if json_output {
@@ -377,8 +461,11 @@ fn cmd_schema(store: &Store, name: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_databases(store: &Store, name: &str, json_output: bool) -> Result<()> {
+fn cmd_databases(store: &Store, name: &str, json_output: bool, verbose_dsn: bool) -> Result<()> {
     let connection = store.get(name)?;
+    if verbose_dsn {
+        emit_verbose_dsn(connection, &store.base);
+    }
     let names = db::databases(connection, &store.base)?;
 
     if json_output {
@@ -400,8 +487,11 @@ fn cmd_databases(store: &Store, name: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_views(store: &Store, name: &str, json_output: bool) -> Result<()> {
+fn cmd_views(store: &Store, name: &str, json_output: bool, verbose_dsn: bool) -> Result<()> {
     let connection = store.get(name)?;
+    if verbose_dsn {
+        emit_verbose_dsn(connection, &store.base);
+    }
     let schema = db::views(connection, &store.base)?;
 
     if json_output {
