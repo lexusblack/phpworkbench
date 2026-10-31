@@ -3,8 +3,8 @@
   "base_keymap": "JetBrains",
   "buffer_font_family": "JetBrains Mono",
   "buffer_font_size": 13,
-  "ui_font_family": "system-ui",
-  "ui_font_size": 14,
+  "ui_font_family": "JetBrains Mono",
+  "ui_font_size": 13,
   "tab_size": 4,
   "hard_tabs": false,
   "preferred_line_length": 120,
@@ -84,5 +84,11 @@
         "clearCache": false
       }
     }
+  },
+  "edit_predictions": {
+    "provider": "none"
+  },
+  "features": {
+    "edit_prediction": false
   }
 }
