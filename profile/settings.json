@@ -14,7 +14,7 @@
   "ensure_final_newline_on_save": true,
   "remove_trailing_whitespace_on_save": true,
   "show_whitespaces": "selection",
-  "relative_line_numbers": "enabled",
+  "relative_line_numbers": true,
   "inlay_hints": {
     "enabled": true
   },
@@ -23,9 +23,6 @@
       "enabled": true,
       "delay_ms": 500
     }
-  },
-  "search": {
-    "case_sensitive": "smart"
   },
   "project_panel": {
     "dock": "left",
