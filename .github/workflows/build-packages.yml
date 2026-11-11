@@ -57,14 +57,16 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/*/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
       - name: Build CLI helper tools (Windows)
         shell: pwsh
         run: |
-          cargo build --release --manifest-path tools/Cargo.toml -p php-db -p php-deploy -p php-http
+          foreach ($tool in @("php-db", "php-deploy", "php-http")) {
+            cargo build --release --manifest-path "tools/$tool/Cargo.toml"
+          }
 
       - name: Build custom PhpWorkbench engine (Windows)
         shell: pwsh
@@ -81,8 +83,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist/windows/bin | Out-Null
           Copy-Item -Force vendor/zed/target/release/zed.exe dist/windows/bin/PhpWorkbench.exe
-          foreach ($tool in @("php-db.exe", "php-deploy.exe", "php-http.exe")) {
-            Copy-Item -Force "tools/target/release/$tool" "dist/windows/bin/$tool"
+          foreach ($tool in @("php-db", "php-deploy", "php-http")) {
+            Copy-Item -Force "tools/$tool/target/release/$tool.exe" "dist/windows/bin/$tool.exe"
           }
           foreach ($extra in @("conpty.dll", "OpenConsole.exe")) {
             $p = "vendor/zed/target/release/$extra"
@@ -184,16 +186,16 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/*/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
       - name: Build CLI helper tools (Linux x86_64)
         run: |
-          cargo build --release --manifest-path tools/Cargo.toml -p php-db -p php-deploy -p php-http
           mkdir -p dist/linux/bin/x86_64
           for tool in php-db php-deploy php-http; do
-            cp "tools/target/release/$tool" "dist/linux/bin/x86_64/$tool"
+            cargo build --release --manifest-path "tools/$tool/Cargo.toml"
+            cp "tools/$tool/target/release/$tool" "dist/linux/bin/x86_64/$tool"
             strip "dist/linux/bin/x86_64/$tool"
           done
 
