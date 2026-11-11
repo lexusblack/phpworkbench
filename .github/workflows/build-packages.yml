@@ -14,6 +14,7 @@ on:
         default: "all"
         options:
           - all
+          - macos
           - linux
           - windows
   push:
@@ -24,6 +25,8 @@ on:
       - "scripts/package-exe.sh"
       - "scripts/package-deb.sh"
       - "scripts/package-rpm.sh"
+      - "scripts/package-dmg.sh"
+      - "design/branding/**"
       - "tools/**"
 
 env:
@@ -37,7 +40,7 @@ env:
 jobs:
   build-windows:
     name: Build Windows x86_64 Binaries
-    if: ${{ !contains(github.event.head_commit.message, '[skip-windows]') && (github.event_name != 'workflow_dispatch' || inputs.target != 'linux') }}
+    if: ${{ !contains(github.event.head_commit.message, '[skip-windows]') && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'windows') }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -152,10 +155,22 @@ jobs:
           path: dist/PhpWorkbench-Setup-*.exe
           if-no-files-found: error
 
-  build-linux-x86_64:
-    name: Build & Package Linux x86_64 (.deb & .rpm)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target != 'windows' }}
-    runs-on: ubuntu-22.04
+  build-linux:
+    name: Build & Package Linux (${{ matrix.name }})
+    if: ${{ !contains(github.event.head_commit.message, '[skip-linux]') && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'linux') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-22.04
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - name: arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            rpm_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
       CC: clang
@@ -163,7 +178,7 @@ jobs:
     steps:
       - name: Free disk space on runner
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup || true
           df -h
 
       - name: Checkout PhpWorkbench
@@ -184,11 +199,13 @@ jobs:
           sudo sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g; s|https://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
           sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 </dev/null
           sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
-            build-essential pkg-config cmake clang lld llvm curl ca-certificates git jq gettext-base \
+            build-essential g++ pkg-config cmake clang lld llvm curl ca-certificates git jq gettext-base \
             musl-tools musl-dev libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev \
             libssl-dev libva-dev libvulkan1 libvulkan-dev libwayland-dev libx11-xcb-dev libxcb-xkb-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev libssh2-1-dev libstdc++-12-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev libssh2-1-dev \
             rpm dpkg-dev python3-pil file </dev/null
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y --no-install-recommends libstdc++-12-dev </dev/null || true
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y --no-install-recommends libclang-rt-dev </dev/null || true
 
       - name: Install Rust toolchain (from engine rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
@@ -203,20 +220,20 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/*/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/*/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-registry-
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
 
-      - name: Build CLI helper tools (Linux x86_64)
+      - name: Build CLI helper tools (Linux ${{ matrix.rpm_arch }})
         run: |
-          mkdir -p dist/linux/bin/x86_64
+          mkdir -p "dist/linux/bin/${{ matrix.rpm_arch }}"
           for tool in php-db php-deploy php-http; do
             cargo build --release --manifest-path "tools/$tool/Cargo.toml"
-            cp "tools/$tool/target/release/$tool" "dist/linux/bin/x86_64/$tool"
-            strip "dist/linux/bin/x86_64/$tool"
+            cp "tools/$tool/target/release/$tool" "dist/linux/bin/${{ matrix.rpm_arch }}/$tool"
+            strip "dist/linux/bin/${{ matrix.rpm_arch }}/$tool"
           done
 
-      - name: Build custom PhpWorkbench engine (Linux x86_64)
+      - name: Build custom PhpWorkbench engine (Linux ${{ matrix.rpm_arch }})
         run: |
           cd vendor/zed
           export ZED_RELEASE_CHANNEL=stable
@@ -224,27 +241,144 @@ jobs:
           export ZED_BUNDLE=true
           export CARGO_INCREMENTAL=0
           cargo --config .cargo/bundle-config.toml build --release --package zed --bin zed
-          mkdir -p ../../dist/linux/bin/x86_64
-          cp target/release/zed ../../dist/linux/bin/x86_64/zed
-          strip ../../dist/linux/bin/x86_64/zed
-          file ../../dist/linux/bin/x86_64/zed
-          ldd ../../dist/linux/bin/x86_64/zed || true
+          mkdir -p "../../dist/linux/bin/${{ matrix.rpm_arch }}"
+          cp target/release/zed "../../dist/linux/bin/${{ matrix.rpm_arch }}/zed"
+          strip "../../dist/linux/bin/${{ matrix.rpm_arch }}/zed"
+          file "../../dist/linux/bin/${{ matrix.rpm_arch }}/zed"
+          ldd "../../dist/linux/bin/${{ matrix.rpm_arch }}/zed" || true
 
-      - name: Build .deb and .rpm packages (x86_64)
+      - name: Build .deb and .rpm packages (${{ matrix.rpm_arch }})
         run: |
-          ./scripts/package-deb.sh amd64
-          ./scripts/package-rpm.sh x86_64
+          ./scripts/package-deb.sh "${{ matrix.deb_arch }}"
+          ./scripts/package-rpm.sh "${{ matrix.rpm_arch }}"
           echo "=== Verify DEB contents ==="
-          dpkg-deb -c dist/phpworkbench_1.0.0_amd64.deb | grep -E "bin/|phpworkbench|themes" || true
+          dpkg-deb -c "dist/phpworkbench_1.0.0_${{ matrix.deb_arch }}.deb" | grep -E "bin/|phpworkbench|themes" || true
           echo "=== Verify RPM contents ==="
-          rpm -qlp dist/phpworkbench-1.0.0-1.x86_64.rpm | grep -E "bin/|phpworkbench" || true
+          rpm -qlp "dist/phpworkbench-1.0.0-1.${{ matrix.rpm_arch }}.rpm" | grep -E "bin/|phpworkbench" || true
           ls -lh dist/*.deb dist/*.rpm
 
-      - name: Upload Linux x86_64 packages (.deb & .rpm)
+      - name: Upload Linux packages (.deb & .rpm)
         uses: actions/upload-artifact@v4
         with:
-          name: PhpWorkbench-Linux-x86_64
+          name: PhpWorkbench-Linux-${{ matrix.rpm_arch }}
           path: |
-            dist/phpworkbench_*_amd64.deb
-            dist/phpworkbench-*-*.x86_64.rpm
+            dist/phpworkbench_*_${{ matrix.deb_arch }}.deb
+            dist/phpworkbench-*-*.${{ matrix.rpm_arch }}.rpm
+          if-no-files-found: error
+
+  build-macos-arm64:
+    name: Build & Package macOS arm64 (.dmg)
+    if: ${{ !contains(github.event.head_commit.message, '[skip-macos]') && (github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'macos') }}
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - name: Checkout PhpWorkbench
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Checkout Custom PhpWorkbench Engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/phpworkbench-engine
+          ref: ${{ github.event.inputs.engine_ref || 'phpworkbench' }}
+          path: vendor/zed
+          fetch-depth: 1
+
+      - name: Install Rust toolchain (from engine rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Cargo registry & git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/*/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+
+      - name: Build CLI helper tools (macOS arm64)
+        run: |
+          for tool in php-db php-deploy php-http; do
+            cargo build --release --manifest-path "tools/$tool/Cargo.toml"
+          done
+
+      - name: Build custom PhpWorkbench engine (macOS arm64)
+        working-directory: vendor/zed
+        run: |
+          export ZED_RELEASE_CHANNEL=stable
+          export RELEASE_CHANNEL=stable
+          export ZED_BUNDLE=true
+          export CARGO_INCREMENTAL=0
+          cargo --config .cargo/bundle-config.toml build --release --package zed --bin zed
+          file target/release/zed
+
+      - name: Assemble PhpWorkbench.app and package DMG
+        run: |
+          APP_DIR="dist/PhpWorkbench.app"
+          rm -rf "$APP_DIR"
+          mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+
+          cp vendor/zed/target/release/zed "$APP_DIR/Contents/MacOS/PhpWorkbench"
+          strip -x "$APP_DIR/Contents/MacOS/PhpWorkbench"
+          for tool in php-db php-deploy php-http; do
+            cp "tools/$tool/target/release/$tool" "$APP_DIR/Contents/MacOS/$tool"
+            strip -x "$APP_DIR/Contents/MacOS/$tool"
+          done
+          chmod 755 "$APP_DIR/Contents/MacOS/"*
+
+          cp design/branding/Tempest.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
+          cp vendor/zed/crates/zed/resources/Document.icns "$APP_DIR/Contents/Resources/Document.icns"
+
+          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>PhpWorkbench</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.tempest.ide</string>
+            <key>CFBundleName</key>
+            <string>PhpWorkbench</string>
+            <key>CFBundleDisplayName</key>
+            <string>PhpWorkbench</string>
+            <key>CFBundleIconFile</key>
+            <string>AppIcon.icns</string>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0.0</string>
+            <key>CFBundleVersion</key>
+            <string>1.0.0</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.15.7</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          codesign --force --deep --sign - "$APP_DIR"
+          codesign --verify --deep --strict "$APP_DIR"
+          file "$APP_DIR/Contents/MacOS/PhpWorkbench"
+
+          ./scripts/package-dmg.sh
+          hdiutil verify dist/PhpWorkbench.dmg
+          ls -lh dist/PhpWorkbench.dmg
+
+      - name: Upload macOS arm64 DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhpWorkbench-macOS-arm64-DMG
+          path: dist/PhpWorkbench.dmg
           if-no-files-found: error
