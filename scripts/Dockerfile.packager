@@ -30,6 +30,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nsis \
     python3-pil \
     file \
+    gnupg \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /etc/apt/keyrings/llvm.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/apt/sources.list.d/llvm-19.list \
+    && apt-get update && apt-get install -y --no-install-recommends libclang-rt-19-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust toolchain
