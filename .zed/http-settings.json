@@ -1,0 +1,68 @@
+{
+  "version": 0,
+  "requests": {
+    "fixtures/http-test/api.http::list": {
+      "method": "GET",
+      "url": "{{host}}/items",
+      "subtab": "authorization",
+      "params": [],
+      "auth": {
+        "kind": "none",
+        "api_key_name": "",
+        "api_key_value": "",
+        "api_key_in": "header",
+        "username": "",
+        "password": "",
+        "token": ""
+      },
+      "headers": [],
+      "body_kind": "none",
+      "raw_content_type": "json",
+      "raw_body": "",
+      "body_fields": [],
+      "follow_redirects": false,
+      "timeout_secs": 30,
+      "verify_tls": true
+    }
+  },
+  "draft": {
+    "method": "GET",
+    "url": "https://back.newsystems.pl/api/user/me",
+    "subtab": "headers",
+    "params": [],
+    "auth": {
+      "kind": "bearer",
+      "api_key_name": "",
+      "api_key_value": "",
+      "api_key_in": "header",
+      "username": "",
+      "password": "",
+      "token": "3287|VGPgpzNPWZyXekgQLP6KpAe0I3Di2oLiCvWcRlNaf54b6f98"
+    },
+    "headers": [
+      {
+        "enabled": true,
+        "key": "Accept",
+        "value": "application/json"
+      },
+      {
+        "enabled": true,
+        "key": "Content-Type",
+        "value": "application/json"
+      }
+    ],
+    "body_kind": "raw",
+    "raw_content_type": "json",
+    "raw_body": "{\n  \"email\": \"darklexusblac@gmail.com\",\n  \"password\": \"\"\n}",
+    "body_fields": [
+      {
+        "enabled": true,
+        "key": "",
+        "value": ""
+      }
+    ],
+    "follow_redirects": true,
+    "timeout_secs": 15,
+    "verify_tls": true
+  }
+}

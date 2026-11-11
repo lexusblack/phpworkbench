@@ -1,0 +1,37 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    git \
+    build-essential \
+    pkg-config \
+    cmake \
+    clang \
+    lld \
+    llvm \
+    libasound2-dev \
+    libfontconfig-dev \
+    libgit2-dev \
+    libglib2.0-dev \
+    libssl-dev \
+    libvulkan-dev \
+    libwayland-dev \
+    libx11-xcb-dev \
+    libxkbcommon-x11-dev \
+    libzstd-dev \
+    libsqlite3-dev \
+    dpkg-dev \
+    rpm \
+    nsis \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace

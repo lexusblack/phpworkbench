@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::{
-    append_history, execute, interpolate, unresolved_var, Body, ExecResult, FormField, Request,
+    append_history, execute, interpolate, unresolved_var, Body, ExecResult, FormField, Overrides, Request,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1121,7 +1121,14 @@ fn execute_prepared(
         body: request.body.clone(),
         body_dir: request.base_dir.clone(),
     };
-    execute(&prepared, vars, follow)
+    execute(
+        &prepared,
+        vars,
+        &Overrides {
+            follow,
+            ..Overrides::default()
+        },
+    )
 }
 
 fn find_request<'a>(collection: &'a Collection, wanted: &str) -> Result<&'a RequestSpec> {

@@ -252,9 +252,9 @@ pub struct Connection {
     /// Unknown keys are kept but ignored; `--verbose-dsn` lists them.
     #[serde(default)]
     pub options: Option<BTreeMap<String, String>>,
-    /// Password decoded from `url` by `normalize`. Internal: it survives the
-    /// ssh-tunnel rewrite, which drops `url` in favour of host/port fields.
-    #[serde(default)]
+    /// Password decoded from `url` by `normalize`, or supplied directly via
+    /// `password` in data source configuration / test connection payloads.
+    #[serde(default, alias = "password")]
     pub resolved_password: Option<String>,
 }
 
@@ -366,11 +366,21 @@ impl Connection {
                 allowed.join(" or ")
             );
         }
-        self.host = Some(parsed.host);
-        self.port = parsed.port;
-        self.user = parsed.user;
-        self.database = parsed.database;
-        self.resolved_password = parsed.password;
+        if !parsed.host.is_empty() {
+            self.host = Some(parsed.host);
+        }
+        if parsed.port.is_some() {
+            self.port = parsed.port;
+        }
+        if parsed.user.is_some() {
+            self.user = parsed.user;
+        }
+        if parsed.database.is_some() {
+            self.database = parsed.database;
+        }
+        if parsed.password.is_some() {
+            self.resolved_password = parsed.password;
+        }
         Ok(())
     }
 
@@ -801,7 +811,8 @@ pub struct ParsedConn {
 /// query parameters are handled. An empty user (`redis://:pw@host`) becomes
 /// `user: None` so password-only urls keep working.
 pub fn url_to_conn(url: &str) -> Result<ParsedConn> {
-    let (scheme, rest) = url
+    let clean_url = url.strip_prefix("jdbc:").unwrap_or(url);
+    let (scheme, rest) = clean_url
         .split_once("://")
         .with_context(|| format!("url must include a scheme: {url}"))?;
     if scheme.is_empty() {
@@ -952,13 +963,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_plaintext_password_field() {
-        let error = parse(
+    fn accepts_plaintext_password_field() {
+        let connections = parse(
             r#"{"connections":[{"name":"app","driver":"sqlite","path":"app.sqlite","password":"nope"}]}"#,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("unknown field"));
+        .unwrap();
+        assert_eq!(connections[0].password().unwrap().as_deref(), Some("nope"));
     }
 
     #[test]
@@ -1196,6 +1206,21 @@ mod tests {
         assert_eq!(parsed.password.as_deref(), Some("pw"));
         assert_eq!(parsed.database.as_deref(), Some("newsystem"));
         assert!(parsed.params.is_empty());
+    }
+
+    #[test]
+    fn url_to_conn_parses_jdbc_urls() {
+        let parsed = url_to_conn("jdbc:mysql://localhost:3306/newsystem").unwrap();
+        assert_eq!(parsed.scheme, "mysql");
+        assert_eq!(parsed.host, "localhost");
+        assert_eq!(parsed.port, Some(3306));
+        assert_eq!(parsed.database.as_deref(), Some("newsystem"));
+
+        let parsed_pg = url_to_conn("jdbc:postgresql://localhost:5432/appdb").unwrap();
+        assert_eq!(parsed_pg.scheme, "postgresql");
+        assert_eq!(parsed_pg.host, "localhost");
+        assert_eq!(parsed_pg.port, Some(5432));
+        assert_eq!(parsed_pg.database.as_deref(), Some("appdb"));
     }
 
     #[test]

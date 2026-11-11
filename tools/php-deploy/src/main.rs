@@ -59,6 +59,7 @@ struct Args {
     command: Option<String>,
     remote_path: Option<String>,
     to: Option<PathBuf>,
+    from: Option<PathBuf>,
     allow_delete: bool,
     recursive: bool,
     json: bool,
@@ -85,6 +86,7 @@ impl Args {
                 "--file" => parsed.file = Some(PathBuf::from(args.next().context("--file path")?)),
                 "--path" => parsed.remote_path = Some(args.next().context("--path REMOTE_PATH")?),
                 "--to" => parsed.to = Some(PathBuf::from(args.next().context("--to LOCAL_PATH")?)),
+                "--from" => parsed.from = Some(PathBuf::from(args.next().context("--from LOCAL_PATH")?)),
                 "--json" => parsed.json = true,
                 "--allow-delete" => parsed.allow_delete = true,
                 "--recursive" => parsed.recursive = true,
@@ -192,6 +194,12 @@ struct Server {
     exclude: Vec<String>,
     #[serde(default)]
     use_rsync: bool,
+    #[serde(default)]
+    rsync_args: Option<String>,
+    #[serde(default)]
+    rsync_path: Option<String>,
+    #[serde(default)]
+    rsync_delete: Option<bool>,
     #[serde(default)]
     upload_on_save: bool,
     #[serde(default)]
@@ -1153,8 +1161,14 @@ fn run() -> Result<()> {
         "check" => check_server(server, &project_root, args.dry_run)?,
         "sync" => sync_server(server, &project_root, args.dry_run)?,
         "upload" => {
-            let file = args.file.clone().context("upload requires --file")?;
-            upload_server(server, &project_root, &file, args.dry_run)?
+            if let (Some(path), Some(from)) = (&args.remote_path, args.from.as_ref().or(args.file.as_ref())) {
+                let relative = normalize_relative_path(path)?;
+                let from_abs = absolute_local_path(from)?;
+                upload_file(server, &project_root, &relative, &from_abs, args.dry_run)?
+            } else {
+                let file = args.file.clone().context("upload requires --file (or --path and --from)")?;
+                upload_server(server, &project_root, &file, args.dry_run)?
+            }
         }
         "watch" => watch_server(server, &project_root, args.interval)?,
         "autodetect" => run_autodetect(server, args.json)?,
@@ -1806,11 +1820,19 @@ fn absolute_local_path(to: &Path) -> Result<PathBuf> {
 }
 
 fn sftp_remote_path(server: &Server, relative: &Path) -> String {
-    format!(
-        "{}/{}",
-        server.remote_root.trim_end_matches('/'),
-        relative.to_string_lossy().replace('\\', "/")
-    )
+    let rel_str = relative.to_string_lossy().replace('\\', "/");
+    let rel_str = rel_str.trim_start_matches('/');
+    let root = server.remote_root.trim_end_matches('/');
+    if root.is_empty() || root == "/" {
+        format!("/{rel_str}")
+    } else {
+        let root_trimmed = root.trim_start_matches('/');
+        if rel_str == root_trimmed || rel_str.starts_with(&format!("{root_trimmed}/")) {
+            format!("/{rel_str}")
+        } else {
+            format!("{root}/{rel_str}")
+        }
+    }
 }
 
 fn download_server(
@@ -1921,21 +1943,25 @@ fn delete_server(
             }
         }
         "sftp" => {
-            if recursive {
-                bail!("recursive delete is not supported over sftp; delete files individually");
-            }
             let remote = sftp_remote_path(server, &relative);
-            let probe = run_ssh_capture(
-                server,
-                &format!(
-                    "if [ -d {0} ]; then echo dir; elif [ -e {0} ]; then echo file; else echo missing; fi",
-                    shell_quote(&remote)
-                ),
-            )?;
-            match probe.trim() {
-                "dir" => run_sftp(server, &format!("rmdir \"{remote}\"\n"))?,
-                "file" => run_sftp(server, &format!("rm \"{remote}\"\n"))?,
-                _ => bail!("remote path not found: {path}"),
+            if recursive {
+                let _ = run_ssh_capture(
+                    server,
+                    &format!("rm -rf {}", shell_quote(&remote)),
+                )?;
+            } else {
+                let probe = run_ssh_capture(
+                    server,
+                    &format!(
+                        "if [ -d {0} ]; then echo dir; elif [ -e {0} ]; then echo file; else echo missing; fi",
+                        shell_quote(&remote)
+                    ),
+                )?;
+                match probe.trim() {
+                    "dir" => run_sftp(server, &format!("rmdir \"{remote}\"\n"))?,
+                    "file" => run_sftp(server, &format!("rm \"{remote}\"\n"))?,
+                    _ => bail!("remote path not found: {path}"),
+                }
             }
         }
         "ftp" | "ftps" => {
@@ -2030,16 +2056,32 @@ fn rsync_rsh(server: &Server) -> String {
     rsh
 }
 
-/// Common rsync arguments: `-az --delete --rsh "ssh …"` plus one
-/// `--exclude=<pattern>` per configured exclude.
+/// Common rsync arguments: `-az [--delete] --rsh "ssh …"` plus one
+/// `--exclude=<pattern>` per configured exclude. If custom `rsync_args`
+/// are configured, they override the `-az [--delete]` prefix.
 fn rsync_args(server: &Server) -> Vec<String> {
-    let mut args = vec!["-az".to_string(), "--delete".to_string()];
+    let mut args = if let Some(custom) = &server.rsync_args {
+        custom
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        let mut default_args = vec!["-az".to_string()];
+        if server.rsync_delete.unwrap_or(true) {
+            default_args.push("--delete".to_string());
+        }
+        default_args
+    };
     args.push("--rsh".to_string());
     args.push(rsync_rsh(server));
     for pattern in &server.exclude {
         args.push(format!("--exclude={pattern}"));
     }
     args
+}
+
+fn rsync_binary(server: &Server) -> &str {
+    server.rsync_path.as_deref().unwrap_or("rsync")
 }
 
 fn rsync_destination(server: &Server) -> String {
@@ -2073,7 +2115,7 @@ fn sync_rsync(server: &Server, root: &Path, dry_run: bool) -> Result<()> {
     if dry_run {
         println!("rsync {}", args.join(" "));
     } else {
-        let output = Command::new("rsync")
+        let output = Command::new(rsync_binary(server))
             .args(&args)
             .output()
             .with_context(|| format!("failed to run rsync (use_rsync with {})", server.protocol))?;
@@ -2099,7 +2141,7 @@ fn upload_rsync_file(
     dry_run: bool,
 ) -> Result<()> {
     let mut args = rsync_args(server);
-    args.remove(1); // --delete is meaningless for a single file
+    args.retain(|arg| arg != "--delete"); // --delete is meaningless for a single file
     if dry_run {
         args.push("-n".to_string());
     }
@@ -2112,7 +2154,7 @@ fn upload_rsync_file(
     if dry_run {
         println!("rsync {}", args.join(" "));
     } else {
-        let output = Command::new("rsync")
+        let output = Command::new(rsync_binary(server))
             .args(&args)
             .output()
             .context("failed to run rsync")?;
@@ -2231,21 +2273,15 @@ fn upload_file(
 }
 
 fn append_sftp_put(batch: &mut String, server: &Server, relative: &Path, absolute: &Path) {
-    let remote_root = server.remote_root.trim_end_matches('/');
-    let mut directory = PathBuf::new();
     if let Some(parent) = relative.parent() {
+        let mut directory = PathBuf::new();
         for component in parent.components() {
             directory.push(component);
-            batch.push_str(&format!(
-                "-mkdir \"{remote_root}/{}\"\n",
-                directory.to_string_lossy()
-            ));
+            let dir_path = sftp_remote_path(server, &directory);
+            batch.push_str(&format!("-mkdir \"{dir_path}\"\n"));
         }
     }
-    let remote_file = format!(
-        "{remote_root}/{}",
-        relative.to_string_lossy().replace('\\', "/")
-    );
+    let remote_file = sftp_remote_path(server, relative);
     batch.push_str(&format!(
         "put \"{}\" \"{}\"\n",
         absolute.display(),
@@ -2423,6 +2459,32 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn sftp_remote_path_deduplicates_root_prefix() {
+        let mut s = server(r#"{"name":"srv","protocol":"sftp","remote_root":"/home"}"#);
+
+        // When relative path already starts with /home (e.g. from SFTP tree traversal)
+        let rel_with_home = Path::new("home/gitlab-runner/builds/app.json");
+        assert_eq!(
+            sftp_remote_path(&s, rel_with_home),
+            "/home/gitlab-runner/builds/app.json"
+        );
+
+        // When relative path does not start with /home (pure relative)
+        let rel_clean = Path::new("gitlab-runner/builds/app.json");
+        assert_eq!(
+            sftp_remote_path(&s, rel_clean),
+            "/home/gitlab-runner/builds/app.json"
+        );
+
+        // When remote_root is /
+        s.remote_root = "/".to_string();
+        assert_eq!(
+            sftp_remote_path(&s, rel_with_home),
+            "/home/gitlab-runner/builds/app.json"
+        );
     }
 
     #[test]
@@ -3303,6 +3365,25 @@ mod tests {
         assert_eq!(
             rsync_destination(&s),
             "deploy@web1:webroot/".to_string()
+        );
+    }
+
+    #[test]
+    fn rsync_custom_args_and_binary() {
+        let s = server(
+            r#"{"name":"w","protocol":"sftp","host":"web1","port":2222,"user":"deploy",
+                "remote_root":"webroot","exclude":[],"rsync_path":"/usr/local/bin/rsync",
+                "rsync_args":"-avz --checksum","rsync_delete":false}"#,
+        );
+        assert_eq!(rsync_binary(&s), "/usr/local/bin/rsync");
+        assert_eq!(
+            rsync_args(&s),
+            vec![
+                "-avz".to_string(),
+                "--checksum".to_string(),
+                "--rsh".to_string(),
+                "ssh -p 2222 -o BatchMode=yes".to_string(),
+            ]
         );
     }
 

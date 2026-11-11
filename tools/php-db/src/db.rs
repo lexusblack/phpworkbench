@@ -840,6 +840,134 @@ pub fn build_exec_command(
 // Process execution
 // ---------------------------------------------------------------------------
 
+fn run_mysql_php_fallback(command: &Command, stdin: Option<&str>) -> Result<Output> {
+    let mut host = "127.0.0.1".to_string();
+    let mut port = "3306".to_string();
+    let mut user = String::new();
+    let mut database = String::new();
+    let mut socket = String::new();
+    let mut password = String::new();
+    let mut sql = stdin.unwrap_or("").to_string();
+
+    let args: Vec<String> = command
+        .get_args()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" if i + 1 < args.len() => {
+                host = args[i + 1].clone();
+                i += 2;
+            }
+            "-P" if i + 1 < args.len() => {
+                port = args[i + 1].clone();
+                i += 2;
+            }
+            "-u" if i + 1 < args.len() => {
+                user = args[i + 1].clone();
+                i += 2;
+            }
+            "-D" if i + 1 < args.len() => {
+                database = args[i + 1].clone();
+                i += 2;
+            }
+            "--socket" if i + 1 < args.len() => {
+                socket = args[i + 1].clone();
+                i += 2;
+            }
+            "-e" if i + 1 < args.len() => {
+                sql = args[i + 1].clone();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
+    for (k, v) in command.get_envs() {
+        if k == "MYSQL_PWD" {
+            if let Some(v) = v {
+                password = v.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    let php_code = r#"
+$host = getenv('PHP_DB_HOST') ?: '127.0.0.1';
+$port = getenv('PHP_DB_PORT') ?: '3306';
+$db = getenv('PHP_DB_NAME') ?: '';
+$user = getenv('PHP_DB_USER') ?: '';
+$pass = getenv('PHP_DB_PASS') ?: '';
+$socket = getenv('PHP_DB_SOCKET') ?: '';
+$dsn = $socket ? "mysql:unix_socket=$socket;dbname=$db;charset=utf8mb4" : "mysql:host=$host;port=$port;dbname=$db;charset=utf8mb4";
+try {
+    $pdo = new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]);
+    $sql = file_get_contents('php://stdin');
+    try {
+        $stmt = $pdo->query($sql);
+    } catch (PDOException $e) {
+        if (strpos($e->getMessage(), '1064') !== false && strpos($sql, '"') !== false) {
+            $pdo->exec("SET SESSION sql_mode = CONCAT_WS(',', @@sql_mode, 'ANSI_QUOTES')");
+            $stmt = $pdo->query($sql);
+        } else {
+            throw $e;
+        }
+    }
+    if ($stmt && $stmt->columnCount() > 0) {
+        $cols = [];
+        for ($i = 0; $i < $stmt->columnCount(); $i++) {
+            $meta = $stmt->getColumnMeta($i);
+            $cols[] = $meta['name'];
+        }
+        echo implode("\t", $cols) . "\n";
+        while ($row = $stmt->fetch(PDO::FETCH_NUM)) {
+            echo implode("\t", array_map(function($v) {
+                return $v === null ? "NULL" : str_replace(["\t", "\n", "\r"], [" ", " ", " "], (string)$v);
+            }, $row)) . "\n";
+        }
+    }
+} catch (PDOException $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+"#;
+
+    let mut php_cmd = Command::new("php");
+    php_cmd
+        .arg("-r")
+        .arg(php_code)
+        .env("PHP_DB_HOST", host)
+        .env("PHP_DB_PORT", port)
+        .env("PHP_DB_USER", user)
+        .env("PHP_DB_NAME", database)
+        .env("PHP_DB_SOCKET", socket)
+        .env("PHP_DB_PASS", password)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = php_cmd
+        .spawn()
+        .with_context(|| "failed to run `php` fallback for mysql")?;
+    if let Some(mut pipe) = child.stdin.take() {
+        pipe.write_all(sql.as_bytes())
+            .with_context(|| "failed to send SQL to php fallback")?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| "failed to wait for php fallback")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        bail!(
+            "mysql (php fallback) failed: {}",
+            if detail.is_empty() { "unknown error" } else { detail }
+        );
+    }
+    Ok(output)
+}
+
 fn run(mut command: Command, label: &str, stdin: Option<&str>) -> Result<Output> {
     let output = match stdin {
         Some(input) => {
@@ -847,9 +975,15 @@ fn run(mut command: Command, label: &str, stdin: Option<&str>) -> Result<Output>
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let mut child = command.spawn().with_context(|| {
-                format!("failed to run `{label}`; is the client installed and on PATH?")
-            })?;
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    if label == "mysql" {
+                        return run_mysql_php_fallback(&command, stdin);
+                    }
+                    bail!("failed to run `{label}`; is the client installed and on PATH?: {error}");
+                }
+            };
             if let Some(mut pipe) = child.stdin.take() {
                 pipe.write_all(input.as_bytes())
                     .with_context(|| format!("failed to send input to `{label}`"))?;
@@ -858,13 +992,26 @@ fn run(mut command: Command, label: &str, stdin: Option<&str>) -> Result<Output>
                 .wait_with_output()
                 .with_context(|| format!("failed to wait for `{label}`"))?
         }
-        None => command.output().with_context(|| {
-            format!("failed to run `{label}`; is the client installed and on PATH?")
-        })?,
+        None => match command.output() {
+            Ok(output) => output,
+            Err(error) => {
+                if label == "mysql" {
+                    return run_mysql_php_fallback(&command, stdin);
+                }
+                bail!("failed to run `{label}`; is the client installed and on PATH?: {error}");
+            }
+        },
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
+        if label == "mysql"
+            && (detail.contains("mysql_native_password")
+                || detail.contains("2059")
+                || detail.contains("Authentication plugin"))
+        {
+            return run_mysql_php_fallback(&command, stdin);
+        }
         bail!(
             "{label} failed ({}): {}",
             output.status,
@@ -1186,7 +1333,8 @@ struct UrlTarget {
 }
 
 fn parse_url_target(url: &str, schemes: &[&str]) -> Result<UrlTarget> {
-    let (scheme, rest) = url
+    let clean_url = url.strip_prefix("jdbc:").unwrap_or(url);
+    let (scheme, rest) = clean_url
         .split_once("://")
         .with_context(|| format!("url must include a scheme: {url}"))?;
     if !schemes.contains(&scheme) {
@@ -1282,13 +1430,21 @@ fn mysql_target(connection: &Connection) -> Result<MysqlTarget> {
     if let Some(url) = connection.url.as_deref().filter(|url| !url.is_empty()) {
         // PhpStorm semantics: the url overrides the individual fields.
         let parsed = parse_mysql_url(url)?;
-        target.host = Some(parsed.host);
-        target.port = parsed.port;
-        target.user = parsed.user;
-        if target.password.is_none() {
+        if !parsed.host.is_empty() {
+            target.host = Some(parsed.host);
+        }
+        if parsed.port.is_some() {
+            target.port = parsed.port;
+        }
+        if parsed.user.is_some() {
+            target.user = parsed.user;
+        }
+        if parsed.password.is_some() {
             target.password = parsed.password;
         }
-        target.database = parsed.database;
+        if parsed.database.is_some() {
+            target.database = parsed.database;
+        }
     }
     if target.host.is_none() && target.socket.is_none() {
         bail!("mysql connection needs a host or socket");
@@ -1402,13 +1558,21 @@ fn sqlserver_target(connection: &Connection) -> Result<SqlServerTarget> {
     if let Some(url) = connection.url.as_deref().filter(|url| !url.is_empty()) {
         // PhpStorm semantics: the url overrides the individual fields.
         let parsed = parse_url_target(url, &["sqlserver", "mssql"])?;
-        target.host = parsed.host;
-        target.port = parsed.port;
-        target.user = parsed.user;
-        if target.password.is_none() {
+        if !parsed.host.is_empty() {
+            target.host = parsed.host;
+        }
+        if parsed.port.is_some() {
+            target.port = parsed.port;
+        }
+        if parsed.user.is_some() {
+            target.user = parsed.user;
+        }
+        if parsed.password.is_some() {
             target.password = parsed.password;
         }
-        target.database = parsed.database;
+        if parsed.database.is_some() {
+            target.database = parsed.database;
+        }
     }
     if target.host.is_empty() {
         bail!("sqlserver connection needs a host");

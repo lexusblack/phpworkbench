@@ -15,3 +15,12 @@ extensions/php-lint/target/
 extensions/php-lint/extension.wasm
 backups/
 .phpunit.cache/
+*.deb
+*.rpm
+*.exe
+*.tar.gz
+*.iso
+*_crop.png
+*.png
+!design/branding/*.png
+!assets/**/*.png

@@ -60,6 +60,18 @@ Feature flags: `php` (вкл.), `collab`, `telemetry`, `ai`, `auto_update`.
 4. CI собирает форк против нового тега; красный CI блокирует ребейз.
 5. `git rerere` включён.
 
+### 8. `crates/zed/src/main.rs`, `crates/zed/src/zed/app_menus.rs`, `crates/zed/Cargo.toml`
+
+Автообновление вырезано целиком: убраны вызовы `auto_update::init` /
+`auto_update_ui::init`, пункты меню «Check for Updates» и «View Release Notes
+Locally», зависимости `auto_update`/`auto_update_ui` у крейта `zed`. Причина:
+стабильный канал форка опрашивал релизы upstream и подменял приложение
+официальным Zed (воспроизведено 2026-10-30: форк 19:17:59 → официальный Zed
+19:18:34). Дефолт `"auto_update": false` в `assets/settings/default.json`
+оставлен как страховка. Крейт `auto_update` остаётся зависимостью
+`title_bar`/`activity_indicator`/`remote_connection` — скачивание
+remote-server для SSH работает.
+
 ## Локальные патчи инструментов
 
 - `crates/extension_cli/src/main.rs` — печать ошибки до `std::process::exit`

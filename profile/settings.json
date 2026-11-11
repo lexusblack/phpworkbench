@@ -2,9 +2,10 @@
   "theme": "PhpStorm Dark",
   "base_keymap": "JetBrains",
   "buffer_font_family": "JetBrains Mono",
-  "buffer_font_size": 13,
-  "ui_font_family": "JetBrains Mono",
-  "ui_font_size": 13,
+  "buffer_font_size": 16,
+  "ui_font_family": ".SystemUIFont",
+  "ui_font_size": 16,
+  "git_commit_buffer_font_size": 15,
   "tab_size": 4,
   "hard_tabs": false,
   "preferred_line_length": 120,
@@ -24,10 +25,16 @@
       "delay_ms": 500
     }
   },
+  "tabs": {
+    "show": true,
+    "show_tab_bar_buttons": true
+  },
   "project_panel": {
     "dock": "left",
     "button": true,
-    "default_width": 260
+    "default_width": 260,
+    "entry_spacing": "comfortable",
+    "file_icons": true
   },
   "outline_panel": {
     "dock": "left",
@@ -36,7 +43,10 @@
   },
   "git_panel": {
     "dock": "left",
-    "button": true
+    "button": true,
+    "starts_open": true,
+    "file_icons": true,
+    "status_style": "label_color"
   },
   "debugger": {
     "dock": "bottom"
@@ -87,5 +97,17 @@
   },
   "features": {
     "edit_prediction": false
-  }
+  },
+  "title_bar": {
+    "show_sign_in": false,
+    "show_user_menu": false,
+    "show_onboarding_banner": false,
+    "show_user_picture": false
+  },
+  "telemetry": {
+    "diagnostics": false,
+    "metrics": false,
+    "anthropic_retention": false
+  },
+  "disable_ai": true
 }

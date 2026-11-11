@@ -24,6 +24,95 @@ pub struct FormField {
     pub is_file: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthOverride {
+    Basic { username: String, password: String },
+    Bearer { token: String },
+}
+
+/// CLI-level request overrides applied after the `.http` file is parsed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Overrides {
+    headers: Vec<(String, String)>,
+    auth: Option<AuthOverride>,
+    form: Vec<(String, String)>,
+    urlencoded: Vec<(String, String)>,
+    raw: Option<String>,
+    timeout_secs: Option<u64>,
+    follow: bool,
+    insecure: bool,
+}
+
+fn base64_encode(input: &str) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b111111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn auth_header(auth: &AuthOverride) -> (String, String) {
+    match auth {
+        AuthOverride::Basic { username, password } => (
+            "Authorization".to_string(),
+            format!("Basic {}", base64_encode(&format!("{username}:{password}"))),
+        ),
+        AuthOverride::Bearer { token } => (
+            "Authorization".to_string(),
+            format!("Bearer {token}"),
+        ),
+    }
+}
+
+fn apply_overrides(req: &mut Request, overrides: &Overrides) {
+    for (name, value) in &overrides.headers {
+        req.headers.push((name.clone(), value.clone()));
+    }
+    if let Some(auth) = &overrides.auth {
+        req.headers.push(auth_header(auth));
+    }
+    if let Some(raw) = &overrides.raw {
+        req.body = Some(Body::Raw(raw.clone()));
+    } else if !overrides.form.is_empty() {
+        req.body = Some(Body::FormData(
+            overrides
+                .form
+                .iter()
+                .map(|(key, value)| FormField {
+                    key: key.clone(),
+                    value: value.clone(),
+                    is_file: false,
+                })
+                .collect(),
+        ));
+    } else if !overrides.urlencoded.is_empty() {
+        req.body = Some(Body::UrlEncoded(overrides.urlencoded.clone()));
+    }
+}
+
+fn read_raw_arg(raw: &str) -> Result<String> {
+    if let Some(text) = raw.strip_prefix('@') {
+        return Ok(text.to_string());
+    }
+    fs::read_to_string(raw).with_context(|| format!("failed to read --raw file: {raw}"))
+}
+
 #[derive(Debug, Clone)]
 struct Request {
     name: String,
@@ -49,7 +138,7 @@ struct ExecResult {
 }
 
 fn usage() -> &'static str {
-    "usage:\n  php-http list <file>\n  php-http run <file> --name <request> [--var key=value]... [--env file] [--json] [--follow] [--history <file>]\n  php-http run <file> --all [--var key=value]... [--env file] [--json] [--follow] [--history <file>]\n  php-http collection list <collection.json>\n  php-http collection env <collection.json> --env <environment.json> [--var key=value]...\n  php-http collection run <collection.json> --request <name|id> [--env <environment.json>] [--var key=value]... [--json] [--follow] [--history <file>]\n  php-http collection run <collection.json> --all [--env <environment.json>] [--var key=value]... [--json] [--fail-fast] [--follow] [--history <file>]"
+    "usage:\n  php-http list <file>\n  php-http run <file> --name <request> [--var key=value]... [--env file] [--json] [--follow] [--timeout secs] [--insecure] [--header 'K: V']... [--auth basic|bearer] [--username u] [--password p] [--token t] [--form k=v]... [--urlencoded k=v]... [--raw <file|@text>] [--history <file>]\n  php-http run <file> --all [same options]\n  php-http collection list <collection.json>\n  php-http collection env <collection.json> --env <environment.json> [--var key=value]...\n  php-http collection run <collection.json> --request <name|id> [--env <environment.json>] [--var key=value]... [--json] [--follow] [--history <file>]\n  php-http collection run <collection.json> --all [--env <environment.json>] [--var key=value]... [--json] [--fail-fast] [--follow] [--history <file>]"
 }
 
 fn parse_var_line(line: &str) -> Option<(String, String)> {
@@ -392,7 +481,23 @@ pub(crate) fn append_history(
     Ok(())
 }
 
-fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Result<ExecResult> {
+fn curl_common_args(overrides: &Overrides) -> Vec<String> {
+    let mut args = vec![
+        "--silent".to_string(),
+        "--show-error".to_string(),
+        "--max-time".to_string(),
+        overrides.timeout_secs.unwrap_or(30).to_string(),
+    ];
+    if overrides.follow {
+        args.push("--location".to_string());
+    }
+    if overrides.insecure {
+        args.push("--insecure".to_string());
+    }
+    args
+}
+
+fn execute(req: &Request, vars: &HashMap<String, String>, overrides: &Overrides) -> Result<ExecResult> {
     let url = interpolate(&req.url, vars);
     if let Some(var) = unresolved_var(&url) {
         bail!(
@@ -409,10 +514,7 @@ fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Resul
 
     let mut cursor = Command::new("curl");
     cursor
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--max-time")
-        .arg("30")
+        .args(curl_common_args(overrides))
         .arg("--request")
         .arg(&req.method)
         .arg("--dump-header")
@@ -421,9 +523,6 @@ fn execute(req: &Request, vars: &HashMap<String, String>, follow: bool) -> Resul
         .arg(&body_path)
         .arg("--write-out")
         .arg("%{http_code}|%{time_total}");
-    if follow {
-        cursor.arg("--location");
-    }
     for (name, value) in &req.headers {
         cursor
             .arg("--header")
@@ -542,12 +641,14 @@ fn print_human(result: &ExecResult) {
 fn run_one(
     req: &Request,
     vars: &HashMap<String, String>,
-    follow: bool,
+    overrides: &Overrides,
     as_json: bool,
     history: Option<&Path>,
     source: &str,
 ) -> Result<()> {
-    let result = execute(req, vars, follow)?;
+    let mut req = req.clone();
+    apply_overrides(&mut req, overrides);
+    let result = execute(&req, vars, overrides)?;
     if let Some(path) = history {
         append_history(
             path,
@@ -606,10 +707,14 @@ fn main() -> Result<()> {
             let mut name: Option<String> = None;
             let mut all = false;
             let mut as_json = false;
-            let mut follow = false;
             let mut env_file: Option<String> = None;
-            let mut overrides: Vec<(String, String)> = Vec::new();
+            let mut vars_overrides: Vec<(String, String)> = Vec::new();
             let mut history: Option<PathBuf> = None;
+            let mut overrides = Overrides::default();
+            let mut auth_kind: Option<String> = None;
+            let mut auth_username = String::new();
+            let mut auth_password = String::new();
+            let mut auth_token = String::new();
 
             let mut i = 2;
             while i < args.len() {
@@ -620,7 +725,70 @@ fn main() -> Result<()> {
                     }
                     "--all" => all = true,
                     "--json" => as_json = true,
-                    "--follow" => follow = true,
+                    "--follow" => overrides.follow = true,
+                    "--insecure" => overrides.insecure = true,
+                    "--timeout" => {
+                        i += 1;
+                        let raw = args.get(i).context("--timeout requires seconds")?;
+                        overrides.timeout_secs = Some(
+                            raw.parse::<u64>()
+                                .with_context(|| format!("invalid --timeout: {raw}"))?,
+                        );
+                    }
+                    "--header" => {
+                        i += 1;
+                        let raw = args.get(i).context("--header requires 'K: V'")?;
+                        let (key, value) = raw
+                            .split_once(':')
+                            .with_context(|| format!("invalid --header (expected 'K: V'): {raw}"))?;
+                        if key.trim().is_empty() {
+                            bail!("invalid --header (empty name): {raw}");
+                        }
+                        overrides
+                            .headers
+                            .push((key.trim().to_string(), value.trim().to_string()));
+                    }
+                    "--auth" => {
+                        i += 1;
+                        auth_kind = Some(args.get(i).context("--auth requires basic|bearer")?.clone());
+                    }
+                    "--username" => {
+                        i += 1;
+                        auth_username = args.get(i).context("--username requires a value")?.clone();
+                    }
+                    "--password" => {
+                        i += 1;
+                        auth_password = args.get(i).context("--password requires a value")?.clone();
+                    }
+                    "--token" => {
+                        i += 1;
+                        auth_token = args.get(i).context("--token requires a value")?.clone();
+                    }
+                    "--form" => {
+                        i += 1;
+                        let raw = args.get(i).context("--form requires key=value")?;
+                        let (key, value) = raw
+                            .split_once('=')
+                            .with_context(|| format!("invalid --form (expected key=value): {raw}"))?;
+                        overrides
+                            .form
+                            .push((key.trim().to_string(), value.to_string()));
+                    }
+                    "--urlencoded" => {
+                        i += 1;
+                        let raw = args.get(i).context("--urlencoded requires key=value")?;
+                        let (key, value) = raw.split_once('=').with_context(|| {
+                            format!("invalid --urlencoded (expected key=value): {raw}")
+                        })?;
+                        overrides
+                            .urlencoded
+                            .push((key.trim().to_string(), value.to_string()));
+                    }
+                    "--raw" => {
+                        i += 1;
+                        let raw = args.get(i).context("--raw requires <file|@text>")?;
+                        overrides.raw = Some(read_raw_arg(raw)?);
+                    }
                     "--history" => {
                         i += 1;
                         history = Some(PathBuf::from(
@@ -637,11 +805,24 @@ fn main() -> Result<()> {
                         let (key, value) = raw.split_once('=').with_context(|| {
                             format!("invalid --var (expected key=value): {}", raw)
                         })?;
-                        overrides.push((key.trim().to_string(), value.trim().to_string()));
+                        vars_overrides.push((key.trim().to_string(), value.trim().to_string()));
                     }
                     other => bail!("unknown run option: {}\n\n{}", other, usage()),
                 }
                 i += 1;
+            }
+
+            if let Some(kind) = auth_kind.as_deref() {
+                overrides.auth = Some(match kind {
+                    "basic" => AuthOverride::Basic {
+                        username: auth_username,
+                        password: auth_password,
+                    },
+                    "bearer" => AuthOverride::Bearer {
+                        token: auth_token,
+                    },
+                    other => bail!("unknown --auth type '{}' (expected basic|bearer)", other),
+                });
             }
 
             if !all && name.is_none() {
@@ -656,7 +837,7 @@ fn main() -> Result<()> {
             if let Some(env) = &env_file {
                 apply_env(&mut vars, Path::new(env))?;
             }
-            for (key, value) in overrides {
+            for (key, value) in vars_overrides {
                 vars.insert(key, value);
             }
 
@@ -664,7 +845,9 @@ fn main() -> Result<()> {
                 if as_json {
                     let mut results = Vec::new();
                     for req in &doc.requests {
-                        let result = execute(req, &vars, follow)?;
+                        let mut req = req.clone();
+                        apply_overrides(&mut req, &overrides);
+                        let result = execute(&req, &vars, &overrides)?;
                         if let Some(path) = history.as_deref() {
                             append_history(
                                 path,
@@ -703,7 +886,7 @@ fn main() -> Result<()> {
                             println!();
                         }
                         println!("=== {} ===", req.name);
-                        run_one(req, &vars, follow, false, history.as_deref(), file)?;
+                        run_one(req, &vars, &overrides, false, history.as_deref(), file)?;
                     }
                 }
             } else {
@@ -711,7 +894,7 @@ fn main() -> Result<()> {
                 let req = doc.requests.iter().find(|r| r.name == wanted);
                 match req {
                     Some(req) => {
-                        run_one(req, &vars, follow, as_json, history.as_deref(), file)?
+                        run_one(req, &vars, &overrides, as_json, history.as_deref(), file)?
                     }
                     None => {
                         let available = doc
@@ -734,6 +917,113 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_encodes_basic_credentials() {
+        assert_eq!(base64_encode("user:pass"), "dXNlcjpwYXNz");
+        assert_eq!(base64_encode("a"), "YQ==");
+        assert_eq!(base64_encode("ab"), "YWI=");
+    }
+
+    #[test]
+    fn auth_header_maps_basic_and_bearer() {
+        assert_eq!(
+            auth_header(&AuthOverride::Basic {
+                username: "user".to_string(),
+                password: "pass".to_string(),
+            }),
+            (
+                "Authorization".to_string(),
+                "Basic dXNlcjpwYXNz".to_string()
+            )
+        );
+        assert_eq!(
+            auth_header(&AuthOverride::Bearer {
+                token: "abc".to_string()
+            }),
+            ("Authorization".to_string(), "Bearer abc".to_string())
+        );
+    }
+
+    #[test]
+    fn overrides_apply_headers_auth_and_body_precedence() {
+        let mut req = Request {
+            name: "r".to_string(),
+            method: "GET".to_string(),
+            url: "http://x".to_string(),
+            headers: Vec::new(),
+            body: None,
+            body_dir: PathBuf::from("."),
+        };
+        let overrides = Overrides {
+            headers: vec![("X-Test".to_string(), "1".to_string())],
+            auth: Some(AuthOverride::Bearer {
+                token: "t".to_string(),
+            }),
+            raw: Some("raw".to_string()),
+            form: vec![("a".to_string(), "b".to_string())],
+            urlencoded: vec![("c".to_string(), "d".to_string())],
+            ..Overrides::default()
+        };
+        apply_overrides(&mut req, &overrides);
+        assert!(req.headers.contains(&("X-Test".to_string(), "1".to_string())));
+        assert!(req
+            .headers
+            .contains(&("Authorization".to_string(), "Bearer t".to_string())));
+        assert_eq!(req.body, Some(Body::Raw("raw".to_string())));
+
+        let mut form_req = req.clone();
+        form_req.body = None;
+        let form_overrides = Overrides {
+            form: vec![("a".to_string(), "b".to_string())],
+            urlencoded: vec![("c".to_string(), "d".to_string())],
+            ..Overrides::default()
+        };
+        apply_overrides(&mut form_req, &form_overrides);
+        assert_eq!(
+            form_req.body,
+            Some(Body::FormData(vec![FormField {
+                key: "a".to_string(),
+                value: "b".to_string(),
+                is_file: false,
+            }]))
+        );
+
+        let mut urlencoded_req = req.clone();
+        urlencoded_req.body = None;
+        let encoded_overrides = Overrides {
+            urlencoded: vec![("c".to_string(), "d".to_string())],
+            ..Overrides::default()
+        };
+        apply_overrides(&mut urlencoded_req, &encoded_overrides);
+        assert_eq!(
+            urlencoded_req.body,
+            Some(Body::UrlEncoded(vec![("c".to_string(), "d".to_string())]))
+        );
+    }
+
+    #[test]
+    fn raw_override_accepts_inline_text() {
+        assert_eq!(read_raw_arg("@hello").expect("inline"), "hello");
+        assert!(read_raw_arg("/definitely/missing/body.txt").is_err());
+    }
+
+    #[test]
+    fn curl_common_args_reflects_timeout_follow_and_insecure() {
+        let args = curl_common_args(&Overrides {
+            timeout_secs: Some(7),
+            follow: true,
+            insecure: true,
+            ..Overrides::default()
+        });
+        assert!(args.windows(2).any(|w| w == ["--max-time", "7"]));
+        assert!(args.contains(&"--location".to_string()));
+        assert!(args.contains(&"--insecure".to_string()));
+
+        let default = curl_common_args(&Overrides::default());
+        assert!(default.windows(2).any(|w| w == ["--max-time", "30"]));
+        assert!(!default.contains(&"--insecure".to_string()));
+    }
 
     #[test]
     fn form_encodes_spaces_and_specials() {

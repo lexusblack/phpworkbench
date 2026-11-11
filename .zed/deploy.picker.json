@@ -1,0 +1,1 @@
+{"servers":[{"name":"server1","protocol":"sftp","host":"91.99.67.105","port":22,"user":"root","ssh_config":"openssh:my","remote_root":"/","local_root":"/Users/admin/phpstorm","web_url":"/","exclude":[],"use_rsync":true,"use_sudo":true,"visible":true,"ssh_auth":"key","ssh_key_path":"/Users/admin/.ssh/id_rsa","ssh_strict_host_key":false,"ssh_keep_alive":15}],"active":"server1"}

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DIST_DIR="$ROOT/dist"
+APP_NAME="PhpWorkbench"
+APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
+DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+STAGE_DIR=$(mktemp -d "/tmp/${APP_NAME}_dmg.XXXXXX")
+
+trap 'rm -rf "$STAGE_DIR"' EXIT
+
+echo "=== Packaging $APP_NAME DMG ==="
+if [ ! -d "$APP_BUNDLE" ]; then
+    echo "Error: $APP_BUNDLE does not exist. Run bundle-app.sh first." >&2
+    exit 1
+fi
+
+echo "1. Staging DMG contents in $STAGE_DIR..."
+cp -R "$APP_BUNDLE" "$STAGE_DIR/"
+ln -s /Applications "$STAGE_DIR/Applications"
+
+echo "2. Creating compressed DMG image at $DMG_PATH..."
+rm -f "$DMG_PATH"
+hdiutil create \
+    -volname "$APP_NAME" \
+    -srcfolder "$STAGE_DIR" \
+    -ov \
+    -format UDZO \
+    "$DMG_PATH"
+
+echo "3. Code signing DMG..."
+codesign --force --sign - "$DMG_PATH" || true
+
+echo "=== Successfully built DMG: $DMG_PATH ==="
+ls -lh "$DMG_PATH"

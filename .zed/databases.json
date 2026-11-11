@@ -1,0 +1,26 @@
+{
+  "connections": [
+    {
+      "name": "newsystem@localhost",
+      "driver": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "newsystem",
+      "database": "newsystem",
+      "password": "newsystem",
+      "url": "jdbc:mysql://127.0.0.1:3306/newsystem",
+      "ssh_tunnel": {
+        "enabled": true,
+        "host": "145.239.30.83",
+        "user": "ubuntu",
+        "port": 22,
+        "auth": "agent",
+        "strict_host_key": false,
+        "keep_alive": 15
+      },
+      "options": {
+        "ssh_config": "openssh:newsystems"
+      }
+    }
+  ]
+}

@@ -1,1 +1,0 @@
-{"connections":[{"name":"_test","driver":"postgres","url":"postgres://app@localhost:5432/app","ssh_tunnel":{"enabled":true,"name":"local-ssh","host":"127.0.0.1","port":22,"user":"admin","auth":"password","password":"secret","strict_host_key":false,"keep_alive":15}}]}
