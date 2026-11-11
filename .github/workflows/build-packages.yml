@@ -7,6 +7,15 @@ on:
         description: "Branch or ref of lexusblack/phpworkbench-engine to build"
         required: false
         default: "phpworkbench"
+      target:
+        description: "Which platform(s) to build"
+        required: false
+        type: choice
+        default: "all"
+        options:
+          - all
+          - linux
+          - windows
   push:
     branches:
       - main
@@ -28,6 +37,7 @@ env:
 jobs:
   build-windows:
     name: Build Windows x86_64 Binaries
+    if: ${{ !contains(github.event.head_commit.message, '[skip-windows]') && (github.event_name != 'workflow_dispatch' || inputs.target != 'linux') }}
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -123,8 +133,9 @@ jobs:
 
       - name: Install NSIS & Pillow
         run: |
-          sudo apt-get update
-          sudo apt-get install -y nsis python3-pil file
+          sudo sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g; s|https://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 </dev/null
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 nsis python3-pil file </dev/null
 
       - name: Build NSIS Windows installer
         run: |
@@ -143,6 +154,7 @@ jobs:
 
   build-linux-x86_64:
     name: Build & Package Linux x86_64 (.deb & .rpm)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target != 'windows' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
@@ -169,9 +181,14 @@ jobs:
 
       - name: Install Linux build & packaging dependencies
         run: |
-          cd vendor/zed
-          ./script/linux
-          sudo apt-get install -y rpm dpkg-dev python3-pil file llvm
+          sudo sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g; s|https://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get update -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 </dev/null
+          sudo env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y --no-install-recommends -o Acquire::Retries=5 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+            build-essential pkg-config cmake clang lld llvm curl ca-certificates git jq gettext-base \
+            musl-tools musl-dev libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev \
+            libssl-dev libva-dev libvulkan1 libvulkan-dev libwayland-dev libx11-xcb-dev libxcb-xkb-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev libsqlite3-dev libssh2-1-dev libstdc++-12-dev \
+            rpm dpkg-dev python3-pil file </dev/null
 
       - name: Install Rust toolchain (from engine rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
