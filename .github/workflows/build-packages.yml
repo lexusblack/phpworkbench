@@ -28,8 +28,10 @@ on:
       - "scripts/package-dmg.sh"
       - "design/branding/**"
       - "tools/**"
+      - "VERSION"
 
 env:
+  PHPWORKBENCH_VERSION: "1.0.1"
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_RELEASE_DEBUG: "0"
@@ -145,8 +147,8 @@ jobs:
           ls -la dist/windows/bin
           file dist/windows/bin/PhpWorkbench.exe
           ./scripts/package-exe.sh
-          file dist/PhpWorkbench-Setup-1.0.0.exe
-          ls -lh dist/PhpWorkbench-Setup-1.0.0.exe
+          file "dist/PhpWorkbench-Setup-${PHPWORKBENCH_VERSION}.exe"
+          ls -lh "dist/PhpWorkbench-Setup-${PHPWORKBENCH_VERSION}.exe"
 
       - name: Upload Windows Installer (.exe)
         uses: actions/upload-artifact@v4
@@ -252,9 +254,9 @@ jobs:
           ./scripts/package-deb.sh "${{ matrix.deb_arch }}"
           ./scripts/package-rpm.sh "${{ matrix.rpm_arch }}"
           echo "=== Verify DEB contents ==="
-          dpkg-deb -c "dist/phpworkbench_1.0.0_${{ matrix.deb_arch }}.deb" | grep -E "bin/|phpworkbench|themes" || true
+          dpkg-deb -c "dist/phpworkbench_${PHPWORKBENCH_VERSION}_${{ matrix.deb_arch }}.deb" | grep -E "bin/|phpworkbench|themes" || true
           echo "=== Verify RPM contents ==="
-          rpm -qlp "dist/phpworkbench-1.0.0-1.${{ matrix.rpm_arch }}.rpm" | grep -E "bin/|phpworkbench" || true
+          rpm -qlp "dist/phpworkbench-${PHPWORKBENCH_VERSION}-1.${{ matrix.rpm_arch }}.rpm" | grep -E "bin/|phpworkbench" || true
           ls -lh dist/*.deb dist/*.rpm
 
       - name: Upload Linux packages (.deb & .rpm)
@@ -335,7 +337,7 @@ jobs:
           cp design/branding/Tempest.icns "$APP_DIR/Contents/Resources/AppIcon.icns"
           cp vendor/zed/crates/zed/resources/Document.icns "$APP_DIR/Contents/Resources/Document.icns"
 
-          cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
+          cat > "$APP_DIR/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -355,9 +357,9 @@ jobs:
             <key>CFBundlePackageType</key>
             <string>APPL</string>
             <key>CFBundleShortVersionString</key>
-            <string>1.0.0</string>
+            <string>${PHPWORKBENCH_VERSION}</string>
             <key>CFBundleVersion</key>
-            <string>1.0.0</string>
+            <string>${PHPWORKBENCH_VERSION}</string>
             <key>LSMinimumSystemVersion</key>
             <string>10.15.7</string>
             <key>NSHighResolutionCapable</key>
@@ -373,12 +375,12 @@ jobs:
           file "$APP_DIR/Contents/MacOS/PhpWorkbench"
 
           ./scripts/package-dmg.sh
-          hdiutil verify dist/PhpWorkbench.dmg
-          ls -lh dist/PhpWorkbench.dmg
+          hdiutil verify "dist/PhpWorkbench-${PHPWORKBENCH_VERSION}.dmg"
+          ls -lh "dist/PhpWorkbench-${PHPWORKBENCH_VERSION}.dmg"
 
       - name: Upload macOS arm64 DMG
         uses: actions/upload-artifact@v4
         with:
           name: PhpWorkbench-macOS-arm64-DMG
-          path: dist/PhpWorkbench.dmg
+          path: dist/PhpWorkbench-*.dmg
           if-no-files-found: error

@@ -4,8 +4,10 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST_DIR="$ROOT/dist"
 APP_NAME="PhpWorkbench"
+VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.1)}"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
-DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
+DMG_NAME="${APP_NAME}-${VERSION}.dmg"
+DMG_PATH="$DIST_DIR/$DMG_NAME"
 STAGE_DIR=$(mktemp -d "/tmp/${APP_NAME}_dmg.XXXXXX")
 
 trap 'rm -rf "$STAGE_DIR"' EXIT
@@ -31,6 +33,8 @@ hdiutil create \
 
 echo "3. Code signing DMG..."
 codesign --force --sign - "$DMG_PATH" || true
+
+ln -sf "$DMG_NAME" "$DIST_DIR/$APP_NAME.dmg"
 
 echo "=== Successfully built DMG: $DMG_PATH ==="
 ls -lh "$DMG_PATH"
