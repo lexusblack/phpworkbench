@@ -1,0 +1,231 @@
+name: Build PhpWorkbench Installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_ref:
+        description: "Branch or ref of lexusblack/phpworkbench-engine to build"
+        required: false
+        default: "phpworkbench"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-packages.yml"
+      - "scripts/package-exe.sh"
+      - "scripts/package-deb.sh"
+      - "scripts/package-rpm.sh"
+      - "tools/**"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+  RELEASE_CHANNEL: stable
+  ZED_RELEASE_CHANNEL: stable
+  ZED_BUNDLE: "true"
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64 Binaries
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout PhpWorkbench
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Checkout Custom PhpWorkbench Engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/phpworkbench-engine
+          ref: ${{ github.event.inputs.engine_ref || 'phpworkbench' }}
+          path: vendor/zed
+          fetch-depth: 1
+
+      - name: Install Rust toolchain (from engine rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Cargo registry & git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build CLI helper tools (Windows)
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path tools/Cargo.toml -p php-db -p php-deploy -p php-http
+
+      - name: Build custom PhpWorkbench engine (Windows)
+        shell: pwsh
+        working-directory: vendor/zed
+        run: |
+          $env:ZED_RELEASE_CHANNEL = "stable"
+          $env:RELEASE_CHANNEL = "stable"
+          $env:ZED_BUNDLE = "true"
+          $env:CARGO_INCREMENTAL = "0"
+          cargo --config .cargo/bundle-config.toml build --release --package zed --bin zed
+
+      - name: Stage Windows PE binaries
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/windows/bin | Out-Null
+          Copy-Item -Force vendor/zed/target/release/zed.exe dist/windows/bin/PhpWorkbench.exe
+          foreach ($tool in @("php-db.exe", "php-deploy.exe", "php-http.exe")) {
+            Copy-Item -Force "tools/target/release/$tool" "dist/windows/bin/$tool"
+          }
+          foreach ($extra in @("conpty.dll", "OpenConsole.exe")) {
+            $p = "vendor/zed/target/release/$extra"
+            if (Test-Path $p) {
+              Copy-Item -Force $p "dist/windows/bin/$extra"
+            }
+          }
+          Get-ChildItem dist/windows/bin
+
+      - name: Upload Windows binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binaries-x86_64
+          path: dist/windows/bin/*
+          if-no-files-found: error
+
+  package-windows-exe:
+    name: Package Windows Installer (.exe)
+    needs: build-windows
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h
+
+      - name: Checkout PhpWorkbench
+        uses: actions/checkout@v4
+
+      - name: Download Windows PE binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binaries-x86_64
+          path: dist/windows/bin
+
+      - name: Install NSIS & Pillow
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nsis python3-pil file
+
+      - name: Build NSIS Windows installer
+        run: |
+          ls -la dist/windows/bin
+          file dist/windows/bin/PhpWorkbench.exe
+          ./scripts/package-exe.sh
+          file dist/PhpWorkbench-Setup-1.0.0.exe
+          ls -lh dist/PhpWorkbench-Setup-1.0.0.exe
+
+      - name: Upload Windows Installer (.exe)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhpWorkbench-Windows-Setup-x86_64
+          path: dist/PhpWorkbench-Setup-*.exe
+          if-no-files-found: error
+
+  build-linux-x86_64:
+    name: Build & Package Linux x86_64 (.deb & .rpm)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - name: Free disk space on runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup
+          df -h
+
+      - name: Checkout PhpWorkbench
+        uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - name: Checkout Custom PhpWorkbench Engine
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/phpworkbench-engine
+          ref: ${{ github.event.inputs.engine_ref || 'phpworkbench' }}
+          path: vendor/zed
+          fetch-depth: 1
+
+      - name: Install Linux build & packaging dependencies
+        run: |
+          cd vendor/zed
+          ./script/linux
+          sudo apt-get install -y rpm dpkg-dev python3-pil file llvm
+
+      - name: Install Rust toolchain (from engine rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Cargo registry & git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('vendor/zed/Cargo.lock', 'tools/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build CLI helper tools (Linux x86_64)
+        run: |
+          cargo build --release --manifest-path tools/Cargo.toml -p php-db -p php-deploy -p php-http
+          mkdir -p dist/linux/bin/x86_64
+          for tool in php-db php-deploy php-http; do
+            cp "tools/target/release/$tool" "dist/linux/bin/x86_64/$tool"
+            strip "dist/linux/bin/x86_64/$tool"
+          done
+
+      - name: Build custom PhpWorkbench engine (Linux x86_64)
+        run: |
+          cd vendor/zed
+          export ZED_RELEASE_CHANNEL=stable
+          export RELEASE_CHANNEL=stable
+          export ZED_BUNDLE=true
+          export CARGO_INCREMENTAL=0
+          cargo --config .cargo/bundle-config.toml build --release --package zed --bin zed
+          mkdir -p ../../dist/linux/bin/x86_64
+          cp target/release/zed ../../dist/linux/bin/x86_64/zed
+          strip ../../dist/linux/bin/x86_64/zed
+          file ../../dist/linux/bin/x86_64/zed
+          ldd ../../dist/linux/bin/x86_64/zed || true
+
+      - name: Build .deb and .rpm packages (x86_64)
+        run: |
+          ./scripts/package-deb.sh amd64
+          ./scripts/package-rpm.sh x86_64
+          echo "=== Verify DEB contents ==="
+          dpkg-deb -c dist/phpworkbench_1.0.0_amd64.deb | grep -E "bin/|phpworkbench|themes" || true
+          echo "=== Verify RPM contents ==="
+          rpm -qlp dist/phpworkbench-1.0.0-1.x86_64.rpm | grep -E "bin/|phpworkbench" || true
+          ls -lh dist/*.deb dist/*.rpm
+
+      - name: Upload Linux x86_64 packages (.deb & .rpm)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhpWorkbench-Linux-x86_64
+          path: |
+            dist/phpworkbench_*_amd64.deb
+            dist/phpworkbench-*-*.x86_64.rpm
+          if-no-files-found: error

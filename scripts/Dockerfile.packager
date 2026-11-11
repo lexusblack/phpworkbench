@@ -22,11 +22,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwayland-dev \
     libx11-xcb-dev \
     libxkbcommon-x11-dev \
+    libva-dev \
     libzstd-dev \
     libsqlite3-dev \
     dpkg-dev \
     rpm \
     nsis \
+    python3-pil \
     file \
     && rm -rf /var/lib/apt/lists/*
 

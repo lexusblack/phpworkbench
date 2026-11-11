@@ -53,49 +53,56 @@ chmod 755 "$INSTALL_ROOT/usr/bin/phpworkbench"
 
 mkdir -p "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin"
 
-# 1. Main IDE binary & engine (Linux ELF)
+# 1. Main IDE binary (custom compiled Linux ELF)
 case "$ARCH" in
     arm64|aarch64) ENGINE_ARCH="aarch64" ;;
     amd64|x86_64)  ENGINE_ARCH="x86_64" ;;
     *)             ENGINE_ARCH="$ARCH" ;;
 esac
 
-ENGINE_DIR="$ROOT/dist/linux/engines/$ENGINE_ARCH/zed.app"
+ARCH_BIN_DIR="$ROOT/dist/linux/bin/$ENGINE_ARCH"
+GENERIC_BIN_DIR="$ROOT/dist/linux/bin"
 
-if [ -d "$ENGINE_DIR" ]; then
-    echo "  Installing Linux ELF IDE engine from $ENGINE_DIR ($ENGINE_ARCH)..."
-    mkdir -p "$INSTALL_ROOT/usr/lib/$PKG_NAME/libexec"
-    mkdir -p "$INSTALL_ROOT/usr/lib/$PKG_NAME/lib"
-    cp -R "$ENGINE_DIR/bin"/* "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/"
-    cp -R "$ENGINE_DIR/libexec"/* "$INSTALL_ROOT/usr/lib/$PKG_NAME/libexec/"
-    cp -R "$ENGINE_DIR/lib"/* "$INSTALL_ROOT/usr/lib/$PKG_NAME/lib/"
-    chmod 755 "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin"/* "$INSTALL_ROOT/usr/lib/$PKG_NAME/libexec"/*
-    echo "  Installed complete Linux IDE engine (bin/zed, libexec/zed-editor, lib/)"
-elif [ -f "$ROOT/dist/linux/bin/zed" ]; then
-    cp "$ROOT/dist/linux/bin/zed" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/zed"
-    chmod 755 "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/zed"
-    echo "  Installed main IDE binary: zed"
-elif [ -f "$ROOT/dist/linux/bin/phpworkbench" ]; then
-    cp "$ROOT/dist/linux/bin/phpworkbench" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
+if [ -f "$ARCH_BIN_DIR/phpworkbench" ]; then
+    cp "$ARCH_BIN_DIR/phpworkbench" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
+elif [ -f "$ARCH_BIN_DIR/zed" ]; then
+    cp "$ARCH_BIN_DIR/zed" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
+elif [ -f "$GENERIC_BIN_DIR/phpworkbench" ]; then
+    cp "$GENERIC_BIN_DIR/phpworkbench" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
+elif [ -f "$GENERIC_BIN_DIR/zed" ]; then
+    cp "$GENERIC_BIN_DIR/zed" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
+elif [ "${ALLOW_MISSING_BINARIES:-0}" != "1" ]; then
+    echo "Error: custom compiled Linux ELF IDE binary not found in $ARCH_BIN_DIR or $GENERIC_BIN_DIR" >&2
+    exit 1
+fi
+
+if [ -f "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench" ]; then
     chmod 755 "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/phpworkbench"
-    echo "  Installed main IDE binary: phpworkbench"
-else
-    echo "  Warning: No Linux ELF zed engine found" >&2
+    echo "  Installed custom Linux ELF IDE binary ($ENGINE_ARCH)"
 fi
 
 # 2. Helper tools (Linux ELF php-db, php-deploy, php-http)
 for tool in php-db php-deploy php-http; do
-    if [ -f "$ROOT/dist/linux/bin/$tool" ]; then
-        cp "$ROOT/dist/linux/bin/$tool" "$INSTALL_ROOT/usr/bin/$tool"
-        cp "$ROOT/dist/linux/bin/$tool" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/$tool"
-        chmod 755 "$INSTALL_ROOT/usr/bin/$tool" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/$tool"
-        echo "  Installed Linux ELF $tool"
+    if [ -f "$ARCH_BIN_DIR/$tool" ]; then
+        SRC_TOOL="$ARCH_BIN_DIR/$tool"
+    elif [ -f "$GENERIC_BIN_DIR/$tool" ]; then
+        SRC_TOOL="$GENERIC_BIN_DIR/$tool"
+    elif [ "${ALLOW_MISSING_BINARIES:-0}" = "1" ]; then
+        continue
+    else
+        echo "Error: Linux ELF helper binary '$tool' not found in $ARCH_BIN_DIR or $GENERIC_BIN_DIR" >&2
+        exit 1
     fi
+    cp "$SRC_TOOL" "$INSTALL_ROOT/usr/bin/$tool"
+    cp "$SRC_TOOL" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/$tool"
+    chmod 755 "$INSTALL_ROOT/usr/bin/$tool" "$INSTALL_ROOT/usr/lib/$PKG_NAME/bin/$tool"
+    echo "  Installed Linux ELF $tool ($ENGINE_ARCH)"
 done
 
-# Resources / assets
-if [ -d "$ROOT/dist/PhpWorkbench.app/Contents/Resources" ]; then
-    cp -R "$ROOT/dist/PhpWorkbench.app/Contents/Resources" "$INSTALL_ROOT/usr/lib/$PKG_NAME/resources"
+# Profile resources
+if [ -d "$ROOT/profile/themes" ]; then
+    mkdir -p "$INSTALL_ROOT/usr/lib/$PKG_NAME/resources/themes"
+    cp -R "$ROOT/profile/themes/"* "$INSTALL_ROOT/usr/lib/$PKG_NAME/resources/themes/"
 fi
 
 # 3. Desktop entry
@@ -124,7 +131,12 @@ if [ -f "$ICON_SRC" ]; then
     cp "$ICON_SRC" "$INSTALL_ROOT/usr/share/icons/hicolor/1024x1024/apps/phpworkbench.png"
     cp "$ICON_SRC" "$INSTALL_ROOT/usr/share/pixmaps/phpworkbench.png"
     for size in 64 128 256 512; do
-        sips -z "$size" "$size" "$ICON_SRC" --out "$INSTALL_ROOT/usr/share/icons/hicolor/${size}x${size}/apps/phpworkbench.png" >/dev/null 2>&1 || true
+        OUT_PNG="$INSTALL_ROOT/usr/share/icons/hicolor/${size}x${size}/apps/phpworkbench.png"
+        if command -v sips >/dev/null 2>&1; then
+            sips -z "$size" "$size" "$ICON_SRC" --out "$OUT_PNG" >/dev/null 2>&1 || true
+        elif python3 -c "import PIL" 2>/dev/null; then
+            python3 -c "from PIL import Image; Image.open('$ICON_SRC').resize(($size, $size), Image.Resampling.LANCZOS).save('$OUT_PNG')" >/dev/null 2>&1 || true
+        fi
     done
 fi
 
@@ -179,7 +191,7 @@ HTTP REST Client, and full PHP toolchain support.
 %install
 rm -rf %{buildroot}
 mkdir -p %{buildroot}
-cp -R /staged_files/* %{buildroot}/
+cp -R %{_staged_files}/* %{buildroot}/
 
 %post
 if [ -x /usr/bin/update-desktop-database ]; then
@@ -217,14 +229,18 @@ SPEC
 echo "6. Running rpmbuild..."
 rm -f "$RPM_PATH"
 
-if docker info >/dev/null 2>&1; then
+if command -v rpmbuild >/dev/null 2>&1; then
+    echo "Using native rpmbuild..."
+    rpmbuild --define "_topdir $RPMROOT" --define "_staged_files $INSTALL_ROOT" --target "$ARCH" -bb "$RPMROOT/SPECS/$PKG_NAME.spec"
+    cp "$RPMROOT/RPMS/$ARCH/"*.rpm "$RPM_PATH"
+elif docker info >/dev/null 2>&1; then
     docker run --rm \
         -v "$RPMROOT":/rpmroot \
         -v "$INSTALL_ROOT":/staged_files \
         -v "$DIST_DIR":/out \
         phpworkbench-packager \
         bash -c "
-            rpmbuild --define '_topdir /rpmroot' --target "$ARCH" -bb /rpmroot/SPECS/$PKG_NAME.spec
+            rpmbuild --define '_topdir /rpmroot' --define '_staged_files /staged_files' --target "$ARCH" -bb /rpmroot/SPECS/$PKG_NAME.spec
             cp /rpmroot/RPMS/$ARCH/*.rpm /out/$RPM_NAME
         "
 else

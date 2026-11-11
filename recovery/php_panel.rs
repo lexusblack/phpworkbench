@@ -53,27 +53,50 @@ use remote_view::RemoteView;
 use table_view::{DatabaseTableView, TableTabTarget};
 
 pub fn resolve_helper_tool(name: &str) -> PathBuf {
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    let exe_name = if exe_suffix.is_empty() || name.ends_with(exe_suffix) {
+        name.to_string()
+    } else {
+        format!("{name}{exe_suffix}")
+    };
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join(name);
+            let candidate = dir.join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+            if let Some(parent) = dir.parent() {
+                let bin_candidate = parent.join("bin").join(&exe_name);
+                if bin_candidate.is_file() {
+                    return bin_candidate;
+                }
+            }
+        }
+    }
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        let candidate = PathBuf::from(cargo_home).join("bin").join(&exe_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    for env_key in ["HOME", "USERPROFILE"] {
+        if let Ok(home) = std::env::var(env_key) {
+            let candidate = PathBuf::from(home).join(".cargo/bin").join(&exe_name);
             if candidate.is_file() {
                 return candidate;
             }
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let candidate = PathBuf::from(home).join(".cargo/bin").join(name);
-        if candidate.is_file() {
-            return candidate;
+    if cfg!(unix) {
+        for dir in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
+            let candidate = Path::new(dir).join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
         }
     }
-    for dir in &["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
-        let candidate = Path::new(dir).join(name);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    PathBuf::from(name)
+    PathBuf::from(exe_name)
 }
 
 actions!(
@@ -84,6 +107,10 @@ actions!(
         OpenDataSourcesDialog,
         OpenSshConfigsDialog,
         BrowseRemoteHost,
+        OpenHttpClient,
+        CreateHttpRequest,
+        RunComposer,
+        OpenDatabaseConsole,
         SelectNextTab,
         SelectPrevTab,
         FocusNextDialogField,
@@ -1248,6 +1275,17 @@ impl DeploymentDialog {
             server.visible = !server.visible;
         }
         self.schedule_validate(cx);
+        cx.notify();
+    }
+
+    fn toggle_upload_on_save(&mut self, cx: &mut Context<Self>) {
+        self.apply_editors(cx);
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(server) = self.servers.get_mut(index) {
+            server.upload_on_save = !server.upload_on_save;
+        }
         cx.notify();
     }
 
@@ -2460,6 +2498,7 @@ enum DeployFocusSlot {
     MappingsTab,
     ExcludedTab,
     Visibility,
+    UploadOnSave,
     ServerType,
     SshConfig,
     SshBrowse,
@@ -2498,6 +2537,7 @@ fn deploy_focus_slots(protocol: &str, tab: DeployTab) -> Vec<DeployFocusSlot> {
     match tab {
         DeployTab::Connection => {
             slots.push(DeployFocusSlot::Visibility);
+            slots.push(DeployFocusSlot::UploadOnSave);
             slots.push(DeployFocusSlot::ServerType);
             for field in deploy_connection_fields(protocol) {
                 match field {
@@ -2721,6 +2761,7 @@ impl Render for DeploymentDialog {
             DeployFocusSlot::MappingsTab,
             DeployFocusSlot::ExcludedTab,
             DeployFocusSlot::Visibility,
+            DeployFocusSlot::UploadOnSave,
             DeployFocusSlot::ServerType,
             DeployFocusSlot::SshConfig,
             DeployFocusSlot::SshBrowse,
@@ -2901,6 +2942,11 @@ impl Render for DeploymentDialog {
             .and_then(|index| self.servers.get(index))
             .map(|server| server.visible)
             .unwrap_or(true);
+        let upload_on_save_state = self
+            .selected
+            .and_then(|index| self.servers.get(index))
+            .map(|server| server.upload_on_save)
+            .unwrap_or(false);
 
         let rsync_state = self
             .selected
@@ -3533,6 +3579,27 @@ impl Render for DeploymentDialog {
                         }))
                         .into_any_element(),
                     );
+                    rows.push(
+                        dialog_toggle_row(
+                            "deploy-upload-on-save",
+                            upload_on_save_state,
+                            "Upload changed files automatically (on save)",
+                            cx,
+                        )
+                        .w_full()
+                        .track_focus(&dialog_slot(&focus, DeployFocusSlot::UploadOnSave))
+                        .focus(|style| style.bg(colors.element_hover))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if dialog_activation_key(event) {
+                                cx.stop_propagation();
+                                this.toggle_upload_on_save(cx);
+                            }
+                        }))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.toggle_upload_on_save(cx);
+                        }))
+                        .into_any_element(),
+                    );
                     rows.push(dialog_row("Type:", type_picker));
                     if self.type_menu_open {
                         let mut menu_rows = Vec::new();
@@ -3951,6 +4018,46 @@ impl Render for DeploymentDialog {
                     ),
             )
     }
+}
+
+fn relative_upload_path(
+    abs_path: &Path,
+    project_root: &Path,
+    local_root: Option<&str>,
+) -> Option<String> {
+    let local_base = match local_root.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(".") => project_root.to_path_buf(),
+        Some(rel) => {
+            let candidate = Path::new(rel);
+            if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                project_root.join(candidate)
+            }
+        }
+    };
+
+    let rel = if let Ok(rel) = abs_path.strip_prefix(&local_base) {
+        rel.to_path_buf()
+    } else {
+        let canon_file = std::fs::canonicalize(abs_path).ok()?;
+        let canon_base = std::fs::canonicalize(&local_base).ok()?;
+        canon_file.strip_prefix(&canon_base).ok()?.to_path_buf()
+    };
+
+    let unix_rel = rel
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    if unix_rel.is_empty() || unix_rel == ".zed/deploy.json" {
+        return None;
+    }
+    Some(unix_rel)
 }
 
 fn load_deploy_servers(root: &Path) -> Vec<RemoteServer> {
@@ -10886,7 +10993,47 @@ impl PhpPanel {
                             .ok();
                     }
                 }
-                workspace.toggle_panel_focus::<PhpPanel>(window, cx);
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenHttpClient, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Http, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &CreateHttpRequest, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Http, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &OpenDatabaseConsole, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Databases, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
+            });
+            workspace.register_action(|workspace, _: &RunComposer, window, cx| {
+                if cx.has_global::<DeployShared>() {
+                    if let Some(panel) = cx.global::<DeployShared>().panel.clone() {
+                        panel
+                            .update(cx, |panel, cx| panel.select_tab(PanelTab::Databases, cx))
+                            .ok();
+                    }
+                }
+                workspace.reveal_panel::<PhpPanel>(window, cx);
             });
             workspace.register_action(|_, _: &SelectNextTab, window, cx| {
                 select_tab_cyclically(window, cx, |active| next_tab(active, 1));
@@ -11160,11 +11307,9 @@ impl PhpPanel {
                 };
 
                 let rel_path = action.rel_path.clone().unwrap_or_default();
-                let pristine_path = PathBuf::from(format!(
-                    "/tmp/phpworkbench-remote-pristine/{}/{}",
-                    server,
-                    rel_path.trim_start_matches('/')
-                ));
+                let pristine_path = remote_file_banner::remote_pristine_root()
+                    .join(&server)
+                    .join(rel_path.trim_start_matches('/'));
 
                 let s_clone = server.clone();
                 let r_clone = rel_path.clone();
@@ -11264,7 +11409,8 @@ impl PhpPanel {
     ) -> Result<Entity<Self>> {
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let project = workspace.project().clone();
-            let workspace_handle = cx.entity().downgrade();
+            let workspace_entity = cx.entity();
+            let workspace_handle = workspace_entity.downgrade();
 
             let panel = cx.new(|cx| {
                 let focus_handle = cx.focus_handle();
@@ -11278,6 +11424,20 @@ impl PhpPanel {
                         cx.notify();
                     }
                 });
+                let workspace_subscription =
+                    cx.subscribe(&workspace_entity, |panel: &mut Self, _, event, cx| {
+                        if let workspace::Event::UserSavedItem { item, .. } = event {
+                            if let Some(item_handle) = item.upgrade() {
+                                if let Some(editor) = item_handle.act_as::<Editor>(cx) {
+                                    if let Some(abs_path) = editor
+                                        .update(cx, |editor, cx| editor.target_file_abs_path(cx))
+                                    {
+                                        panel.maybe_upload_saved_local_file(abs_path, cx);
+                                    }
+                                }
+                            }
+                        }
+                    });
 
                 Self {
                     focus_handle,
@@ -11365,7 +11525,7 @@ impl PhpPanel {
                     remote_context_menu: None,
                     remote_clipboard: None,
                     saved_message: None,
-                    _subscriptions: vec![subscription],
+                    _subscriptions: vec![subscription, workspace_subscription],
                 }
             });
             let indicator = cx.new(|cx| DeployServerIndicator::new(cx));
@@ -13739,11 +13899,9 @@ impl PhpPanel {
         cx: &mut Context<Self>,
     ) {
         let Some(root) = root else { return; };
-        let pristine_path = PathBuf::from(format!(
-            "/tmp/phpworkbench-remote-pristine/{}/{}",
-            server_name,
-            remote_path.trim_start_matches('/')
-        ));
+        let pristine_path = remote_file_banner::remote_pristine_root()
+            .join(&server_name)
+            .join(remote_path.trim_start_matches('/'));
 
         self.saved_message = Some("comparing with local version…".to_string());
         cx.notify();
@@ -13956,11 +14114,9 @@ impl PhpPanel {
         cx.notify();
 
         let safe_rel = path.trim_start_matches('/');
-        let target = PathBuf::from(format!(
-            "/tmp/phpworkbench-remote/{}/{}",
-            server,
-            safe_rel
-        ));
+        let target = remote_file_banner::remote_temp_root()
+            .join(&server)
+            .join(safe_rel);
         let task_server = server.clone();
         let task_path = path.clone();
         let task_target = target.clone();
@@ -14661,6 +14817,96 @@ impl PhpPanel {
         });
         self.ensure_remote_selected(cx);
         cx.notify();
+    }
+
+    fn maybe_upload_saved_local_file(&mut self, abs_path: PathBuf, cx: &mut Context<Self>) {
+        // Remote temp files opened from the Remote Host tree auto-upload via RemoteFileBanner.
+        if remote_file_banner::parse_remote_path(&abs_path).is_some() {
+            return;
+        }
+        if self.remote_servers.is_empty() {
+            self.refresh(cx);
+        }
+        let shared_active = cx
+            .try_global::<DeployShared>()
+            .and_then(|shared| shared.active.clone());
+        let selected_name = shared_active.or_else(|| self.active_server.clone());
+        let server = selected_name
+            .as_deref()
+            .and_then(|name| self.remote_servers.iter().find(|s| s.name == name))
+            .or_else(|| self.remote_servers.first())
+            .cloned();
+        let Some(server) = server else {
+            return;
+        };
+        if !server.upload_on_save {
+            return;
+        }
+        let Some(rel_path) =
+            relative_upload_path(&abs_path, &server.root, server.local_root.as_deref())
+        else {
+            return;
+        };
+
+        let server_name = server.name.clone();
+        let server_root = server.root.clone();
+        self.sync_status
+            .insert(server_name.clone(), SyncStatus::Syncing);
+        self.saved_message = Some(format!("uploading {} to {}…", rel_path, server_name));
+        cx.notify();
+
+        let task_server = server_name.clone();
+        let task_rel = rel_path.clone();
+        let task: Task<Result<String, String>> = cx.background_spawn(async move {
+            let mut command = util::command::new_command(resolve_helper_tool("php-deploy"));
+            command
+                .current_dir(&server_root)
+                .arg("upload")
+                .arg("--server")
+                .arg(&task_server)
+                .arg("--path")
+                .arg(&task_rel)
+                .arg("--from")
+                .arg(&abs_path);
+            let output = command.output().await.map_err(|error| error.to_string())?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                Ok(if stdout.is_empty() {
+                    format!("uploaded {} to {}", task_rel, task_server)
+                } else {
+                    stdout
+                })
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(if stderr.is_empty() {
+                    format!("exit {}", output.status.code().unwrap_or(1))
+                } else {
+                    stderr
+                })
+            }
+        });
+
+        cx.spawn(async move |panel, cx| {
+            let result = task.await;
+            panel
+                .update(cx, |panel, cx| {
+                    match result {
+                        Ok(msg) => {
+                            panel.sync_status.insert(server_name.clone(), SyncStatus::Ok);
+                            panel.saved_message = Some(msg);
+                        }
+                        Err(err) => {
+                            panel
+                                .sync_status
+                                .insert(server_name.clone(), SyncStatus::Failed(err.clone()));
+                            panel.saved_message = Some(format!("auto-upload failed: {err}"));
+                        }
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        })
+        .detach();
     }
 
     fn run_server_check(&mut self, name: String, root: PathBuf, cx: &mut Context<Self>) {
@@ -16139,6 +16385,34 @@ impl Panel for PhpPanel {
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
         true
+    }
+
+    fn active_subview(&self, _cx: &App) -> Option<String> {
+        Some(match self.active_tab {
+            PanelTab::Databases => "databases",
+            PanelTab::Remote => "remote",
+            PanelTab::Http => "http",
+            PanelTab::Tests => "tests",
+            PanelTab::Collections => "collections",
+        }.to_string())
+    }
+
+    fn activate_subview(&mut self, name: &str, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match name {
+            "databases" => {
+                self.select_tab(PanelTab::Databases, cx);
+                true
+            }
+            "remote" => {
+                self.select_tab(PanelTab::Remote, cx);
+                true
+            }
+            "http" => {
+                self.select_tab(PanelTab::Http, cx);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -17877,96 +18151,12 @@ impl Render for PhpPanel {
 
         let colors = cx.theme().colors();
 
-        let remote_sidebar_header = h_flex()
-            .id("remote-sidebar-header")
-            .w_full()
-            .flex_none()
-            .px_2p5()
-            .py_2()
-            .items_center()
-            .justify_between()
-            .bg(colors.tab_bar_background)
-            .border_b_1()
-            .border_color(colors.border)
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::Server)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    )
-                    .child(
-                        Label::new("Remote Host")
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .weight(FontWeight::SEMIBOLD),
-                    ),
-            )
-            .child(
-                Button::new("remote-open-editor", "Open in Editor ↗")
-                    .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Custom(Rems(0.8)))
-                    .style(ButtonStyle::Subtle)
-                    .tooltip(Tooltip::text("Open remote deployment & files in center editor"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_remote_client_tab(window, cx);
-                    })),
-            );
-
-        let database_sidebar_header = h_flex()
-            .id("database-sidebar-header")
-            .w_full()
-            .flex_none()
-            .px_2p5()
-            .py_1p5()
-            .items_center()
-            .justify_between()
-            .bg(colors.tab_bar_background)
-            .border_b_1()
-            .border_color(colors.border)
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .items_center()
-                    .child(
-                        Label::new("Database")
-                            .size(LabelSize::Custom(PANEL_TEXT_REMS))
-                            .weight(FontWeight::SEMIBOLD),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        IconButton::new("db-locate", IconName::Crosshair)
-                            .shape(IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
-                            .icon_color(Color::Muted)
-                            .tooltip(Tooltip::text("Locate in Database Explorer"))
-                    )
-                    .child(
-                        Button::new("db-open-editor", "Open in Editor ↗")
-                            .size(ButtonSize::Compact)
-                            .label_size(LabelSize::Custom(Rems(0.8)))
-                            .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text("Open SQL console & data in center editor"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_database_client_tab(window, cx);
-                            })),
-                    ),
-            );
-
-        let stripe = self.render_compact_stripe(cx);
-
         let content = match self.active_tab {
             PanelTab::Remote => v_flex()
                 .id("remote-content")
                 .relative()
                 .flex_1()
                 .min_h_0()
-                .child(remote_sidebar_header)
                 .child(remote_toolbar)
                 .children(remote_server_menu)
                 .child(remote_status)
@@ -17994,7 +18184,6 @@ impl Render for PhpPanel {
                 .relative()
                 .flex_1()
                 .min_h_0()
-                .child(database_sidebar_header)
                 .child(database_toolbar)
                 .children(database_driver_menu)
                 .when_some(
@@ -18120,7 +18309,6 @@ impl Render for PhpPanel {
                     .children(saved_message_row)
                     .child(content),
             )
-            .child(stripe)
     }
 }
 
@@ -23547,6 +23735,7 @@ fn select_tab_cyclically(
 }
 
 impl PhpPanel {
+    #[allow(dead_code)]
     fn render_compact_stripe(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         let active_tab = self.active_tab;
@@ -26675,13 +26864,40 @@ Host web1
 
         // First three slots are always the tab strip.
         assert_eq!(connection[3], DeployFocusSlot::Visibility);
+        assert_eq!(connection[4], DeployFocusSlot::UploadOnSave);
         assert_eq!(mappings[3], DeployFocusSlot::MappingLocal);
         assert_eq!(excluded[3], DeployFocusSlot::ExcludedPaths);
 
         assert!(connection.contains(&DeployFocusSlot::Visibility));
+        assert!(connection.contains(&DeployFocusSlot::UploadOnSave));
         assert!(!mappings.contains(&DeployFocusSlot::Visibility));
         assert!(mappings.contains(&DeployFocusSlot::MappingRemote));
         assert!(!excluded.contains(&DeployFocusSlot::WebUrl));
+    }
+
+    #[test]
+    fn relative_upload_path_resolves_project_and_subroot_paths() {
+        let root = Path::new("/tmp/phpworkbench-test-project");
+        assert_eq!(
+            relative_upload_path(
+                &root.join("src/Controller/HomeController.php"),
+                root,
+                None,
+            ),
+            Some("src/Controller/HomeController.php".to_string())
+        );
+        assert_eq!(
+            relative_upload_path(&root.join("public/index.php"), root, Some("public")),
+            Some("index.php".to_string())
+        );
+        assert_eq!(
+            relative_upload_path(&root.join(".zed/deploy.json"), root, Some(".")),
+            None
+        );
+        assert_eq!(
+            relative_upload_path(Path::new("/tmp/other/file.php"), root, None),
+            None
+        );
     }
 
     #[test]

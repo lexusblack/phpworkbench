@@ -30,60 +30,45 @@ PYEOF
 
 cp "$ICO_PATH" "$FILES_DIR/resources/phpworkbench.ico"
 
-# 2. Launcher & files
-echo "2. Staging launcher scripts & resources..."
-cat <<'EOF' > "$FILES_DIR/phpworkbench.cmd"
-@echo off
-setlocal
-set "APP_DIR=%~dp0"
-set "PATH=%APP_DIR%bin;%PATH%"
+# 2. Binaries, CLI shim & files
+echo "2. Staging Windows PE binaries & resources..."
+BIN_SRC_DIR="$ROOT/dist/windows/bin"
 
-if exist "%APP_DIR%bin\PhpWorkbench.exe" (
-    start "" "%APP_DIR%bin\PhpWorkbench.exe" %*
-) else if exist "%APP_DIR%bin\zed.exe" (
-    start "" "%APP_DIR%bin\zed.exe" %*
-) else if exist "%APP_DIR%bin\Zed.exe" (
-    start "" "%APP_DIR%bin\Zed.exe" %*
-) else if exist "%LOCALAPPDATA%\Programs\Zed\zed.exe" (
-    start "" "%LOCALAPPDATA%\Programs\Zed\zed.exe" %*
-) else if exist "%LOCALAPPDATA%\Programs\Zed\Zed.exe" (
-    start "" "%LOCALAPPDATA%\Programs\Zed\Zed.exe" %*
-) else if exist "%APP_DIR%bin\Zed-Engine-Setup.exe" (
-    echo Initializing PhpWorkbench core engine...
-    start /wait "" "%APP_DIR%bin\Zed-Engine-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="%APP_DIR%bin"
-    if exist "%APP_DIR%bin\zed.exe" (
-        start "" "%APP_DIR%bin\zed.exe" %*
-    ) else if exist "%APP_DIR%bin\Zed.exe" (
-        start "" "%APP_DIR%bin\Zed.exe" %*
-    ) else (
-        echo PhpWorkbench launcher: engine extraction failed.
-        pause
-    )
-) else (
-    echo PhpWorkbench launcher: binary not found in %APP_DIR%bin
-    pause
-)
-endlocal
-EOF
-
-# Copy Windows IDE core engine setup
-if [ -f "$ROOT/dist/windows/Zed-Setup.exe" ]; then
-    echo "  Staging Windows IDE core engine setup..."
-    cp "$ROOT/dist/windows/Zed-Setup.exe" "$FILES_DIR/bin/Zed-Engine-Setup.exe"
+if [ -f "$BIN_SRC_DIR/PhpWorkbench.exe" ]; then
+    cp "$BIN_SRC_DIR/PhpWorkbench.exe" "$FILES_DIR/bin/PhpWorkbench.exe"
+elif [ -f "$BIN_SRC_DIR/zed.exe" ]; then
+    cp "$BIN_SRC_DIR/zed.exe" "$FILES_DIR/bin/PhpWorkbench.exe"
+elif [ "${ALLOW_MISSING_BINARIES:-0}" != "1" ]; then
+    echo "Error: compiled custom engine binary not found at $BIN_SRC_DIR/PhpWorkbench.exe or $BIN_SRC_DIR/zed.exe" >&2
+    exit 1
 fi
 
-# Copy helper tools
-for tool in php-db php-deploy php-http; do
-    if [ -f "$ROOT/dist/PhpWorkbench.app/Contents/MacOS/$tool" ]; then
-        cp "$ROOT/dist/PhpWorkbench.app/Contents/MacOS/$tool" "$FILES_DIR/bin/$tool.exe"
-    elif [ -f "$HOME/.cargo/bin/$tool" ]; then
-        cp "$HOME/.cargo/bin/$tool" "$FILES_DIR/bin/$tool.exe"
+for extra in conpty.dll OpenConsole.exe; do
+    if [ -f "$BIN_SRC_DIR/$extra" ]; then
+        cp "$BIN_SRC_DIR/$extra" "$FILES_DIR/bin/$extra"
     fi
 done
 
-# Copy resources (fonts, icons, themes, keymaps, settings)
-if [ -d "$ROOT/dist/PhpWorkbench.app/Contents/Resources" ]; then
-    cp -R "$ROOT/dist/PhpWorkbench.app/Contents/Resources"/* "$FILES_DIR/resources/"
+for tool in php-db php-deploy php-http; do
+    if [ -f "$BIN_SRC_DIR/$tool.exe" ]; then
+        cp "$BIN_SRC_DIR/$tool.exe" "$FILES_DIR/bin/$tool.exe"
+    elif [ "${ALLOW_MISSING_BINARIES:-0}" != "1" ]; then
+        echo "Error: compiled Windows helper binary not found at $BIN_SRC_DIR/$tool.exe" >&2
+        exit 1
+    fi
+done
+
+cat <<'EOF' > "$FILES_DIR/bin/phpworkbench.cmd"
+@echo off
+setlocal
+start "" "%~dp0PhpWorkbench.exe" %*
+endlocal
+EOF
+
+# Copy profile resources if present alongside compiled embedded assets
+if [ -d "$ROOT/profile/themes" ]; then
+    mkdir -p "$FILES_DIR/resources/themes"
+    cp -R "$ROOT/profile/themes/"* "$FILES_DIR/resources/themes/"
 fi
 
 # License & Readme
@@ -114,8 +99,15 @@ SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "FileFunc.nsh"
 
+!ifndef STAGE_DIR
+  !define STAGE_DIR "/stage"
+!endif
+!ifndef OUT_FILE
+  !define OUT_FILE "/out/$EXE_NAME"
+!endif
+
 Name "$PKG_NAME"
-OutFile "/out/$EXE_NAME"
+OutFile "\${OUT_FILE}"
 InstallDir "\$LOCALAPPDATA\\Programs\\$PKG_NAME"
 InstallDirRegKey HKCU "Software\\$PKG_NAME" "InstallDir"
 RequestExecutionLevel user
@@ -128,12 +120,12 @@ VIAddVersionKey "FileDescription" "PhpWorkbench Installer"
 VIAddVersionKey "FileVersion" "${VERSION}.0"
 
 !define MUI_ABORTWARNING
-!define MUI_ICON "/stage/phpworkbench.ico"
-!define MUI_UNICON "/stage/phpworkbench.ico"
+!define MUI_ICON "\${STAGE_DIR}/phpworkbench.ico"
+!define MUI_UNICON "\${STAGE_DIR}/phpworkbench.ico"
 
 ; Installer Pages
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_LICENSE "/stage/LICENSE.txt"
+!insertmacro MUI_PAGE_LICENSE "\${STAGE_DIR}/LICENSE.txt"
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
@@ -147,24 +139,18 @@ VIAddVersionKey "FileVersion" "${VERSION}.0"
 Section "PhpWorkbench (required)" SecCore
     SectionIn RO
     SetOutPath "\$INSTDIR"
-    File /r "/stage/files/*"
-
-    ; Install and extract IDE core engine into bin directory
-    DetailPrint "Configuring PhpWorkbench core engine..."
-    IfFileExists "\$INSTDIR\\bin\\Zed-Engine-Setup.exe" 0 +3
-    ExecWait '"\$INSTDIR\\bin\\Zed-Engine-Setup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR="\$INSTDIR\\bin"'
-    Delete "\$INSTDIR\\bin\\Zed-Engine-Setup.exe"
+    File /r "\${STAGE_DIR}/files/*"
 
     ; Create uninstaller
     WriteUninstaller "\$INSTDIR\\Uninstall.exe"
 
-    ; Start Menu Shortcuts
+    ; Start Menu Shortcuts (launch PhpWorkbench.exe directly without cmd.exe console window)
     CreateDirectory "\$SMPROGRAMS\\$PKG_NAME"
-    CreateShortcut "\$SMPROGRAMS\\$PKG_NAME\\$PKG_NAME.lnk" "\$INSTDIR\\phpworkbench.cmd" "" "\$INSTDIR\\resources\\phpworkbench.ico" 0
+    CreateShortcut "\$SMPROGRAMS\\$PKG_NAME\\$PKG_NAME.lnk" "\$INSTDIR\\bin\\PhpWorkbench.exe" "" "\$INSTDIR\\resources\\phpworkbench.ico" 0
     CreateShortcut "\$SMPROGRAMS\\$PKG_NAME\\Uninstall $PKG_NAME.lnk" "\$INSTDIR\\Uninstall.exe"
 
     ; Desktop Shortcut
-    CreateShortcut "\$DESKTOP\\$PKG_NAME.lnk" "\$INSTDIR\\phpworkbench.cmd" "" "\$INSTDIR\\resources\\phpworkbench.ico" 0
+    CreateShortcut "\$DESKTOP\\$PKG_NAME.lnk" "\$INSTDIR\\bin\\PhpWorkbench.exe" "" "\$INSTDIR\\resources\\phpworkbench.ico" 0
 
     ; Windows Add/Remove Programs Registry
     WriteRegStr HKCU "Software\\$PKG_NAME" "InstallDir" "\$INSTDIR"
@@ -192,14 +178,16 @@ NSI
 echo "4. Running makensis..."
 rm -f "$EXE_PATH"
 
-if docker info >/dev/null 2>&1; then
+if command -v makensis >/dev/null 2>&1; then
+    makensis -DSTAGE_DIR="$STAGE_DIR" -DOUT_FILE="$EXE_PATH" "$STAGE_DIR/installer.nsi"
+elif docker info >/dev/null 2>&1; then
     docker run --rm \
         -v "$STAGE_DIR":/stage \
         -v "$DIST_DIR":/out \
         phpworkbench-packager \
-        makensis /stage/installer.nsi
+        makensis -DSTAGE_DIR=/stage -DOUT_FILE="/out/$EXE_NAME" /stage/installer.nsi
 else
-    echo "Error: Docker required for makensis on macOS" >&2
+    echo "Error: makensis or Docker required to build Windows installer" >&2
     exit 1
 fi
 
