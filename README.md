@@ -27,6 +27,7 @@ PhpStorm-класс рабочего процесса на базе Zed.
 
 | Файл | Назначение |
 |---|---|
+| `docs/BUILD.md` | локальная сборка на Windows, Linux и macOS |
 | `docs/PLAN.md` | фазы, оценки, критерии выхода |
 | `docs/ARCHITECTURE.md` | слои, крейты, точки патча ядра |
 | `docs/DECISIONS.md` | ADR: что выбрано и почему |
