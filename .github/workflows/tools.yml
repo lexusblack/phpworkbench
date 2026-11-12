@@ -1,8 +1,19 @@
 name: tools
 
 on:
+  workflow_dispatch:
   push:
+    paths:
+      - "tools/**"
+      - "fixtures/**"
+      - "scripts/acceptance.sh"
+      - ".github/workflows/tools.yml"
   pull_request:
+    paths:
+      - "tools/**"
+      - "fixtures/**"
+      - "scripts/acceptance.sh"
+      - ".github/workflows/tools.yml"
 
 jobs:
   acceptance:
