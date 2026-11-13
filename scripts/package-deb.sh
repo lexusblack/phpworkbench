@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST_DIR="$ROOT/dist"
 PKG_NAME="phpworkbench"
-VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.1)}"
+VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.2)}"
 ARCH="${1:-arm64}"
 DEB_NAME="${PKG_NAME}_${VERSION}_${ARCH}.deb"
 DEB_PATH="$DIST_DIR/$DEB_NAME"

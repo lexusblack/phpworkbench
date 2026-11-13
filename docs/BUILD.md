@@ -86,7 +86,7 @@ foreach ($extra in @("conpty.dll", "OpenConsole.exe")) {
 ```bash
 sudo apt-get update && sudo apt-get install -y nsis python3-pil file
 ./scripts/package-exe.sh
-# Результат: dist/PhpWorkbench-Setup-1.0.1.exe
+# Результат: dist/PhpWorkbench-Setup-1.0.2.exe
 ```
 
 ---

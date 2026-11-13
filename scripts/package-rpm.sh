@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST_DIR="$ROOT/dist"
 PKG_NAME="phpworkbench"
-VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.1)}"
+VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.2)}"
 RELEASE="1"
 ARCH="${1:-aarch64}"
 RPM_NAME="${PKG_NAME}-${VERSION}-${RELEASE}.${ARCH}.rpm"
@@ -221,6 +221,9 @@ fi
 /usr/share/doc/%{name}
 
 %changelog
+* Fri Nov 13 2026 PhpWorkbench Team <support@phpworkbench.dev> - 1.0.2-1
+- Add PhpStorm-style Git Branches popup with quick actions, hierarchical search, and branch submenus.
+
 * Wed Nov 11 2026 PhpWorkbench Team <support@phpworkbench.dev> - 1.0.1-1
 - Align default dock layout across platforms, add platform keybinding tooltips, and bump version to 1.0.1.
 
