@@ -15,7 +15,7 @@
   "ensure_final_newline_on_save": true,
   "remove_trailing_whitespace_on_save": true,
   "show_whitespaces": "selection",
-  "relative_line_numbers": true,
+  "relative_line_numbers": false,
   "inlay_hints": {
     "enabled": true
   },
