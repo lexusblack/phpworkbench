@@ -82,8 +82,8 @@
   "languages": {
     "PHP": {
       "language_servers": [
-        "phpantom",
-        "!intelephense",
+        "intelephense",
+        "!phpantom",
         "!phpactor",
         "!phptools"
       ],
@@ -103,6 +103,10 @@
       }
     },
     "intelephense": {
+      "binary": {
+        "path": "intelephense",
+        "arguments": ["--stdio"]
+      },
       "initialization_options": {
         "storagePath": "/tmp/intelephense",
         "clearCache": false
