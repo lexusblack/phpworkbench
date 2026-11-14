@@ -240,6 +240,10 @@ struct Server {
     keep_alive_seconds: u32,
     #[serde(default = "default_encoding")]
     encoding: String,
+    #[serde(default)]
+    keychain_service: Option<String>,
+    #[serde(default)]
+    keychain: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -1225,6 +1229,26 @@ fn print_help() {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn read_from_keychain(service: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(&["find-generic-password", "-s", service, "-w"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let pw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !pw.is_empty() {
+            return Some(pw);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_from_keychain(_service: &str) -> Option<String> {
+    None
+}
+
 fn load_config(explicit: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     let path = match explicit {
         Some(path) => path,
@@ -1246,10 +1270,25 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(Config, PathBuf)> {
 
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let config: Config = serde_json::from_str(&contents)
+    let mut config: Config = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     if config.servers.is_empty() {
         bail!("no servers configured in {}", path.display());
+    }
+
+    // Resolve passwords from system Keychain if not supplied in plaintext
+    for server in &mut config.servers {
+        if server.password.as_deref().unwrap_or("").is_empty() {
+            if let Some(ref svc) = server.keychain_service {
+                if let Some(pw) = read_from_keychain(svc) {
+                    server.password = Some(pw);
+                }
+            } else if server.keychain == Some(true) {
+                if let Some(pw) = read_from_keychain(&format!("PhpWorkbench Deployment \u{2014} {}", server.name)) {
+                    server.password = Some(pw);
+                }
+            }
+        }
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));

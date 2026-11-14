@@ -162,6 +162,10 @@ pub struct SshTunnel {
     pub strict_host_key: bool,
     #[serde(default = "default_keep_alive")]
     pub keep_alive: u64,
+    #[serde(default)]
+    pub keychain_service: Option<String>,
+    #[serde(default)]
+    pub keychain: Option<bool>,
 }
 
 fn default_ssh_port() -> u16 {
@@ -256,6 +260,31 @@ pub struct Connection {
     /// `password` in data source configuration / test connection payloads.
     #[serde(default, alias = "password")]
     pub resolved_password: Option<String>,
+    #[serde(default)]
+    pub keychain_service: Option<String>,
+    #[serde(default)]
+    pub keychain: Option<bool>,
+}
+
+/// Resolves generic password from macOS Keychain for a given service.
+#[cfg(target_os = "macos")]
+pub fn read_from_keychain(service: &str) -> Option<String> {
+    let output = std::process::Command::new("security")
+        .args(&["find-generic-password", "-s", service, "-w"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let pw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !pw.is_empty() {
+            return Some(pw);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_from_keychain(_service: &str) -> Option<String> {
+    None
 }
 
 pub struct Store {
@@ -508,12 +537,30 @@ impl Connection {
     /// Reads the password from the environment variable named by `password_env`.
     /// Without `password_env`, the password decoded from `url` (or embedded in
     /// `url` when normalization was skipped) is used as a fallback.
+    /// Also resolves from macOS Keychain (`keychain_service` or `PhpWorkbench DB — <name>`).
     pub fn password(&self) -> Result<Option<String>> {
         match &self.password_env {
-            None => Ok(self
-                .resolved_password
-                .clone()
-                .or_else(|| self.url_password())),
+            None => {
+                if let Some(ref p) = self.resolved_password {
+                    if !p.is_empty() {
+                        return Ok(Some(p.clone()));
+                    }
+                }
+                if let Some(p) = self.url_password() {
+                    return Ok(Some(p));
+                }
+                if let Some(ref svc) = self.keychain_service {
+                    if let Some(pass) = read_from_keychain(svc) {
+                        return Ok(Some(pass));
+                    }
+                }
+                if self.keychain == Some(true) {
+                    if let Some(pass) = read_from_keychain(&format!("PhpWorkbench DB \u{2014} {}", self.name)) {
+                        return Ok(Some(pass));
+                    }
+                }
+                Ok(None)
+            }
             Some(var) => match env::var(var) {
                 Ok(value) => Ok(Some(value)),
                 Err(_) => bail!(
@@ -1178,6 +1225,8 @@ mod tests {
             read_only: false,
             options: None,
             resolved_password: None,
+            keychain_service: None,
+            keychain: None,
         };
         let error = connection.password().unwrap_err().to_string();
         assert!(error.contains("PHP_DB_TEST_UNSET_VAR"));
