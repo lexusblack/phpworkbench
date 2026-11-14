@@ -1230,11 +1230,16 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(Config, PathBuf)> {
         Some(path) => path,
         None => {
             let current = env::current_dir()?;
-            let candidate = current.join(".zed/deploy.json");
-            if candidate.exists() {
-                candidate
+            let pw = current.join(".phpworkbench/deploy.json");
+            if pw.exists() {
+                pw
             } else {
-                bail!("no .zed/deploy.json found (or pass --config)");
+                let candidate = current.join(".zed/deploy.json");
+                if candidate.exists() {
+                    candidate
+                } else {
+                    bail!("no .phpworkbench/deploy.json or .zed/deploy.json found (or pass --config)");
+                }
             }
         }
     };

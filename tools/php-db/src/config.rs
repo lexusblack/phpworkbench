@@ -684,13 +684,17 @@ fn driver_list() -> String {
 fn find_config() -> Result<PathBuf> {
     let cwd = env::current_dir().context("cannot determine the current directory")?;
     for dir in cwd.ancestors() {
+        let pw = dir.join(".phpworkbench").join("databases.json");
+        if pw.is_file() {
+            return Ok(pw);
+        }
         let candidate = dir.join(".zed").join("databases.json");
         if candidate.is_file() {
             return Ok(candidate);
         }
     }
     bail!(
-        "no .zed/databases.json found in {} or any parent directory (use --config PATH)",
+        "no .phpworkbench/databases.json or .zed/databases.json found in {} or any parent directory (use --config PATH)",
         cwd.display()
     );
 }
