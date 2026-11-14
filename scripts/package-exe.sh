@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST_DIR="$ROOT/dist"
 PKG_NAME="PhpWorkbench"
-VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.2)}"
+VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.3)}"
 EXE_NAME="${PKG_NAME}-Setup-${VERSION}.exe"
 EXE_PATH="$DIST_DIR/$EXE_NAME"
 STAGE_DIR=$(mktemp -d "/tmp/${PKG_NAME}_exe.XXXXXX")

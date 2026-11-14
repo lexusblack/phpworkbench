@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST_DIR="$ROOT/dist"
 PKG_NAME="phpworkbench"
-VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.2)}"
+VERSION="${PHPWORKBENCH_VERSION:-$(cat "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || echo 1.0.3)}"
 RELEASE="1"
 ARCH="${1:-aarch64}"
 RPM_NAME="${PKG_NAME}-${VERSION}-${RELEASE}.${ARCH}.rpm"
@@ -221,6 +221,9 @@ fi
 /usr/share/doc/%{name}
 
 %changelog
+* Sat Nov 14 2026 PhpWorkbench Team <support@phpworkbench.dev> - 1.0.3-1
+- Fix branch popup borrow checker error and support Alt+Click quick documentation popup.
+
 * Fri Nov 13 2026 PhpWorkbench Team <support@phpworkbench.dev> - 1.0.2-1
 - Add PhpStorm-style Git Branches popup with quick actions, hierarchical search, and branch submenus.
 

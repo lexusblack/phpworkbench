@@ -122,7 +122,7 @@ cat >"$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>${PHPWORKBENCH_VERSION:-1.0.2}</string>
+  <string>${PHPWORKBENCH_VERSION:-1.0.3}</string>
   <key>LSMinimumSystemVersion</key>
   <string>10.15.7</string>
 </dict>
