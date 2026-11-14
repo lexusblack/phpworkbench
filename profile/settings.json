@@ -1,6 +1,8 @@
 {
   "theme": "PhpStorm Dark",
   "base_keymap": "JetBrains",
+  "go_to_definition_fallback": "none",
+  "lsp_results_location": "picker",
   "buffer_font_family": "JetBrains Mono",
   "buffer_font_size": 16,
   "ui_font_family": ".SystemUIFont",
