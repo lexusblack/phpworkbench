@@ -1,5 +1,20 @@
 {
   "theme": "PhpStorm Dark",
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.svn",
+    "**/.hg",
+    "**/.jj",
+    "**/.sl",
+    "**/.repo",
+    "**/CVS",
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/.classpath",
+    "**/.settings",
+    "**/.zed",
+    "**/.phpworkbench"
+  ],
   "base_keymap": "JetBrains",
   "go_to_definition_fallback": "none",
   "lsp_results_location": "picker",
