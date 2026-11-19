@@ -376,7 +376,7 @@ impl Connection {
         };
         let allowed: &[&str] = match driver {
             Driver::Postgres => &["postgres", "postgresql"],
-            Driver::Mysql => &["mysql"],
+            Driver::Mysql => &["mysql", "mariadb"],
             Driver::MariaDb => &["mysql", "mariadb"],
             Driver::SqlServer => &["sqlserver", "mssql"],
             Driver::Redis => &["redis", "rediss"],

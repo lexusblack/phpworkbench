@@ -1380,11 +1380,7 @@ fn parse_url_target(url: &str, schemes: &[&str]) -> Result<UrlTarget> {
 }
 
 fn parse_mysql_url(url: &str) -> Result<UrlTarget> {
-    let target = parse_url_target(url, &["mysql"])?;
-    if target.database.is_none() {
-        bail!("mysql url must include a database name");
-    }
-    Ok(target)
+    parse_url_target(url, &["mysql", "mariadb"])
 }
 
 fn split_host_port(value: &str) -> Result<(String, Option<u16>)> {
@@ -2534,9 +2530,17 @@ mod tests {
         assert_eq!(target.port, Some(3306));
         assert_eq!(target.database.as_deref(), Some("appdb"));
 
+        let target = parse_mysql_url("mysql://localhost:3306").unwrap();
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.port, Some(3306));
+        assert_eq!(target.database, None);
+
+        let target = parse_mysql_url("jdbc:mariadb://127.0.0.1:3306/myinterview").unwrap();
+        assert_eq!(target.host, "127.0.0.1");
+        assert_eq!(target.port, Some(3306));
+        assert_eq!(target.database.as_deref(), Some("myinterview"));
+
         assert!(parse_mysql_url("postgres://x/y").is_err());
-        assert!(parse_mysql_url("mysql://localhost:3306").is_err());
-        assert!(parse_mysql_url("mysql://localhost/").is_err());
     }
 
     #[test]
