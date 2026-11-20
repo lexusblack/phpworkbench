@@ -387,7 +387,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: [build-windows, package-windows, build-linux, build-macos-arm64]
+    needs: [build-windows, package-windows-exe, build-linux, build-macos-arm64]
     if: ${{ always() && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
