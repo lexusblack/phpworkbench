@@ -2239,15 +2239,129 @@ fn upload_server(
         bail!("{} is excluded by deploy config", relative.display());
     }
 
-    if server.use_rsync && server.protocol == "sftp" && server.resolved_auth() != SshAuth::Password
-    {
-        return upload_rsync_file(server, relative, &absolute, dry_run);
+    if absolute.is_dir() {
+        return upload_directory(server, project_root, &relative, &absolute, dry_run);
     }
 
-    upload_file(server, project_root, relative, &absolute, dry_run)
+    if server.use_rsync && server.protocol == "sftp" && server.resolved_auth() != SshAuth::Password
+    {
+        return upload_rsync_file(server, &relative, &absolute, dry_run);
+    }
+
+    upload_single_file(server, project_root, &relative, &absolute, dry_run)
 }
 
 fn upload_file(
+    server: &Server,
+    project_root: &Path,
+    relative: &Path,
+    absolute: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    if absolute.is_dir() {
+        return upload_directory(server, project_root, relative, absolute, dry_run);
+    }
+    upload_single_file(server, project_root, relative, absolute, dry_run)
+}
+
+fn upload_directory(
+    server: &Server,
+    project_root: &Path,
+    relative: &Path,
+    absolute: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    let mut files = Vec::new();
+    visit(project_root, absolute, &server.exclude, &mut files)?;
+    files.sort();
+
+    if files.is_empty() {
+        create_remote_directory(server, project_root, relative, dry_run)?;
+        println!("created remote directory {}", relative.display());
+        return Ok(());
+    }
+
+    match server.protocol.as_str() {
+        "sftp" => {
+            let mut batch = String::new();
+            for file in &files {
+                let rel = file.strip_prefix(project_root).unwrap_or(file);
+                append_sftp_put(&mut batch, server, rel, file);
+            }
+            if dry_run {
+                println!("{batch}");
+                return Ok(());
+            }
+            run_sftp(server, &batch)?;
+            println!("uploaded directory {} ({} files)", relative.display(), files.len());
+        }
+        _ => {
+            for file in &files {
+                let rel = file.strip_prefix(project_root).unwrap_or(file);
+                upload_single_file(server, project_root, rel, file, dry_run)?;
+            }
+            println!("uploaded directory {} ({} files)", relative.display(), files.len());
+        }
+    }
+    Ok(())
+}
+
+fn create_remote_directory(
+    server: &Server,
+    project_root: &Path,
+    relative: &Path,
+    dry_run: bool,
+) -> Result<()> {
+    if dry_run {
+        println!("mkdir {}", relative.display());
+        return Ok(());
+    }
+    match server.protocol.as_str() {
+        "local" | "in-place" => {
+            let target = match server.protocol.as_str() {
+                "in-place" => in_place_root(server, project_root)?.join(relative),
+                _ => PathBuf::from(&server.remote_root).join(relative),
+            };
+            fs::create_dir_all(&target)?;
+        }
+        "sftp" => {
+            let mut batch = String::new();
+            let mut directory = PathBuf::new();
+            for component in relative.components() {
+                directory.push(component);
+                let dir_path = sftp_remote_path(server, &directory);
+                batch.push_str(&format!("-mkdir \"{dir_path}\"\n"));
+            }
+            run_sftp(server, &batch)?;
+        }
+        "ftp" | "ftps" => {
+            let remote = relative.to_string_lossy().replace('\\', "/");
+            let dir = relative_dir_path(&server.remote_root, &remote);
+            let mut command = with_args(
+                curl_transport_command(server)?,
+                &["-sS", "--connect-timeout", "5", "--max-time", "30", "--ftp-create-dirs"],
+            );
+            append_curl_auth(&mut command, server.user.as_deref(), server.curl_secret());
+            command.args(["-Q", &format!("MKD /{dir}")]);
+            command.arg(ftp_url(server, "")?);
+            let _ = run_curl(command, server.curl_secret());
+        }
+        "webdav" | "webdavs" => {
+            let mut command = webdav_command(server)?;
+            command.args(["-X", "MKCOL"]);
+            command.arg(webdav_url(
+                server,
+                &relative.to_string_lossy().replace('\\', "/"),
+                true,
+            )?);
+            let _ = run_curl(command, server.curl_secret());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn upload_single_file(
     server: &Server,
     project_root: &Path,
     relative: &Path,
@@ -3692,5 +3806,43 @@ mod tests {
         // delete removes the file for real
         delete_webdav(&s, Path::new("a.txt")).unwrap();
         assert!(!dir.join("a.txt").exists());
+    }
+
+    #[test]
+    fn upload_directory_copies_all_nested_files_recursively() {
+        let root = scratch("upload-dir-src");
+        let remote = scratch("upload-dir-remote");
+
+        // create directory structure:
+        // root/services/finances/Banking.php
+        // root/services/finances/reports/Q1.php
+        let src_dir = root.join("services").join("finances");
+        let reports_dir = src_dir.join("reports");
+        fs::create_dir_all(&reports_dir).unwrap();
+        fs::write(src_dir.join("Banking.php"), b"<?php class Banking {}").unwrap();
+        fs::write(reports_dir.join("Q1.php"), b"<?php return 100;").unwrap();
+
+        let s = server(&format!(
+            r#"{{"name":"loc","protocol":"local","remote_root":"{}"}}"#,
+            remote.to_string_lossy().replace('\\', "/")
+        ));
+
+        // upload the folder 'services/finances'
+        upload_file(
+            &s,
+            &root,
+            Path::new("services/finances"),
+            &src_dir,
+            false,
+        )
+        .unwrap();
+
+        // verify target files exist inside remote directory and not as a single file
+        let remote_banking = remote.join("services").join("finances").join("Banking.php");
+        let remote_q1 = remote.join("services").join("finances").join("reports").join("Q1.php");
+        assert!(remote_banking.exists(), "remote Banking.php should exist");
+        assert_eq!(fs::read(&remote_banking).unwrap(), b"<?php class Banking {}");
+        assert!(remote_q1.exists(), "remote reports/Q1.php should exist");
+        assert_eq!(fs::read(&remote_q1).unwrap(), b"<?php return 100;");
     }
 }
