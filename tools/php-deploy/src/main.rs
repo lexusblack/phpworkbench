@@ -1292,7 +1292,8 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(Config, PathBuf)> {
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));
-    let project_root = if parent.file_name().and_then(|name| name.to_str()) == Some(".zed") {
+    let parent_name = parent.file_name().and_then(|name| name.to_str());
+    let project_root = if parent_name == Some(".zed") || parent_name == Some(".phpworkbench") {
         parent.parent().unwrap_or(parent).to_path_buf()
     } else {
         parent.to_path_buf()
@@ -2272,7 +2273,8 @@ fn upload_directory(
     dry_run: bool,
 ) -> Result<()> {
     let mut files = Vec::new();
-    visit(project_root, absolute, &server.exclude, &mut files)?;
+    let base_root = local_root(server, project_root);
+    visit(&base_root, absolute, &server.exclude, &mut files)?;
     files.sort();
 
     if files.is_empty() {
@@ -2285,8 +2287,15 @@ fn upload_directory(
         "sftp" => {
             let mut batch = String::new();
             for file in &files {
-                let rel = file.strip_prefix(project_root).unwrap_or(file);
-                append_sftp_put(&mut batch, server, rel, file);
+                let rel = file
+                    .strip_prefix(absolute)
+                    .map(|sub| relative.join(sub))
+                    .unwrap_or_else(|_| {
+                        file.strip_prefix(&base_root)
+                            .unwrap_or_else(|_| file.strip_prefix(project_root).unwrap_or(file))
+                            .to_path_buf()
+                    });
+                append_sftp_put(&mut batch, server, &rel, file);
             }
             if dry_run {
                 println!("{batch}");
@@ -2297,8 +2306,15 @@ fn upload_directory(
         }
         _ => {
             for file in &files {
-                let rel = file.strip_prefix(project_root).unwrap_or(file);
-                upload_single_file(server, project_root, rel, file, dry_run)?;
+                let rel = file
+                    .strip_prefix(absolute)
+                    .map(|sub| relative.join(sub))
+                    .unwrap_or_else(|_| {
+                        file.strip_prefix(&base_root)
+                            .unwrap_or_else(|_| file.strip_prefix(project_root).unwrap_or(file))
+                            .to_path_buf()
+                    });
+                upload_single_file(server, project_root, &rel, file, dry_run)?;
             }
             println!("uploaded directory {} ({} files)", relative.display(), files.len());
         }
@@ -2368,6 +2384,9 @@ fn upload_single_file(
     absolute: &Path,
     dry_run: bool,
 ) -> Result<()> {
+    if absolute.is_dir() {
+        return upload_directory(server, project_root, relative, absolute, dry_run);
+    }
     match server.protocol.as_str() {
         "local" | "in-place" => {
             let target = match server.protocol.as_str() {
