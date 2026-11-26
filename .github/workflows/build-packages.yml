@@ -193,12 +193,12 @@ jobs:
 
       - name: Checkout PhpWorkbench
         uses: actions/checkout@v4
+        with:
+          clean: true
 
       - name: Load version from VERSION file
         shell: bash
         run: echo "PHPWORKBENCH_VERSION=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_ENV
-        with:
-          clean: true
 
       - name: Checkout Custom PhpWorkbench Engine
         uses: actions/checkout@v4
@@ -288,12 +288,12 @@ jobs:
     steps:
       - name: Checkout PhpWorkbench
         uses: actions/checkout@v4
+        with:
+          clean: true
 
       - name: Load version from VERSION file
         shell: bash
         run: echo "PHPWORKBENCH_VERSION=$(cat VERSION | tr -d '[:space:]')" >> $GITHUB_ENV
-        with:
-          clean: true
 
       - name: Checkout Custom PhpWorkbench Engine
         uses: actions/checkout@v4
